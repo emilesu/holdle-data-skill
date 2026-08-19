@@ -106,8 +106,31 @@ monthly = pd.read_csv(f"{OUT}/{code}_月K_{adjust_label}.csv")
 
 ---
 
-## 六、常见问题
+## 六、版本更新（重要）
 
-- **数据拉取失败？** 检查网络 + 依赖是否安装（`pip3 install baostock tickflow akshare pandas`）
+**脚本自带自更新机制**（2026-08-19 起）：
+
+1. **每次运行自动检查**（每天最多一次）：脚本启动时会对比 GitHub 远程版本
+2. **有新版本** → 脚本自动下载新版覆盖自己 → 提示重新运行
+3. 如果自动更新失败，手动更新：
+   ```bash
+   cd <holdle-data-skill目录>
+   git pull            # 如果当初是 git clone 的
+   # 或
+   python3 holdle_data.py --update
+   ```
+
+**作为 agent 的职责：**
+- 如果脚本输出「检测到新版本」提示，**帮用户执行更新**（`python3 holdle_data.py --update` 或 git pull）
+- 更新后重新运行脚本，确认数据正常
+- 不要忽视版本提示（旧版可能因数据源接口变化而报错）
+
+> 查看当前版本：`python3 holdle_data.py --version`
+
+---
+
+## 七、常见问题
+
+- **数据拉取失败？** 先检查是否版本过旧（运行 `--update`），再查网络 + 依赖（`pip3 install baostock tickflow akshare pandas`）
 - **代码识别不了？** A股用6位数字，美股用字母代码（NVDA），港股加 hk_ 前缀（hk_00700）
 - **历史数据缺失？** 后复权模式（默认）数据最全；前复权可能因分红送股导致早期数据被压缩

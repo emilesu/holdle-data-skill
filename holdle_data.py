@@ -57,6 +57,12 @@ try:
 except ImportError:
     ak = None
 
+# ── 版本与更新（2026-08-19 新增自更新机制） ──────
+VERSION = "1.0.0"                      # skill 包版本（与 version.json 对齐）
+VERSION_URL = "https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/version.json"
+VERSION_CHECK_INTERVAL = 86400         # 每天最多检查一次更新（秒）
+_UPDATE_MARKER = "HOLDLE_DATA_SKILL"   # 自更新安全标记
+
 # ── 配置 ──────────────────────────────────────────
 MAX_RETRIES = 3
 RETRY_DELAY = 2
@@ -70,6 +76,77 @@ ADJUST_MAP = {
     "forward":  {"tickflow": "forward",  "baostock": "2", "label": "前复权"},
 }
 DEFAULT_ADJUST = "backward"
+
+
+# ═══════════════════════════════════════════════════
+#  版本自检与更新（A+C 方案：脚本自检 + 自动更新）
+# ═══════════════════════════════════════════════════
+def _check_update(force=False):
+    """检查是否有新版本。每天最多一次（本地时间戳）。force=True 强制检查。"""
+    import json as _json
+    import time as _time
+
+    stamp_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".version_check_stamp")
+    if not force and os.path.exists(stamp_file):
+        try:
+            last = float(open(stamp_file).read().strip())
+            if _time.time() - last < VERSION_CHECK_INTERVAL:
+                return  # 距离上次检查不足一天，跳过
+        except Exception:
+            pass
+
+    try:
+        import urllib.request as _urlreq
+        req = _urlreq.Request(VERSION_URL, headers={"User-Agent": "holdle-data/1.0"})
+        with _urlreq.urlopen(req, timeout=8) as resp:
+            remote = _json.loads(resp.read().decode("utf-8"))
+        remote_ver = remote.get("version", "")
+        # 写时间戳
+        try:
+            open(stamp_file, "w").write(str(_time.time()))
+        except Exception:
+            pass
+        if remote_ver != VERSION:
+            print(f"\n  🔄 检测到新版本 v{remote_ver}（当前 v{VERSION}）")
+            print(f"     更新说明: {remote.get('changelog', '')}")
+            print(f"     正在自动更新...")
+            _auto_update(remote_ver)
+        else:
+            print(f"  ✅ 已是最新版本 v{VERSION}")
+    except Exception as e:
+        # 检查失败不阻塞主流程
+        print(f"  ⚠️ 版本检查失败（{e}），继续使用本地版本")
+
+
+def _auto_update(new_ver):
+    """自动下载新版脚本覆盖自己（A+C 方案）。从固定 HTTPS URL 下载。"""
+    import urllib.request as _urlreq
+
+    script_url = "https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/holdle_data.py"
+    try:
+        req = _urlreq.Request(script_url, headers={"User-Agent": "holdle-data/1.0"})
+        with _urlreq.urlopen(req, timeout=15) as resp:
+            content = resp.read()
+        # 安全校验：必须是我们的脚本（含更新标记 + VERSION 声明）
+        text = content.decode("utf-8", errors="ignore")
+        if _UPDATE_MARKER not in text or "VERSION =" not in text:
+            print("  ❌ 下载内容校验失败（非 HOLDLE 脚本），已中止更新")
+            return
+        # 备份当前 + 写入新版
+        self_path = os.path.abspath(__file__)
+        backup = self_path + ".bak"
+        try:
+            import shutil
+            shutil.copy2(self_path, backup)
+        except Exception:
+            pass
+        with open(self_path, "wb") as f:
+            f.write(content)
+        print(f"  ✅ 已更新到 v{new_ver}（旧版备份: {os.path.basename(backup)}）")
+        print(f"     请重新运行本脚本。")
+        sys.exit(0)
+    except Exception as e:
+        print(f"  ❌ 自动更新失败（{e}），请手动更新：git pull 或重新下载")
 
 
 # ═══════════════════════════════════════════════════
@@ -388,11 +465,19 @@ def main():
         print("  美股示例:  NVDA    AAPL    MSFT")
         print("  港股示例:  hk_00700  hk_09988")
         print("  --adjust: backward=后复权(默认,历史复盘/回测) forward=前复权(当前时点判断)")
+        print("  --update: 检查并自动更新到最新版")
+        print("  --version: 显示当前版本")
         sys.exit(1)
 
-    # 解析 --adjust
+    # 解析 --adjust / --update / --check-update
     adjust = DEFAULT_ADJUST
     args = sys.argv[1:]
+    if "--update" in args or "--check-update" in args:
+        _check_update(force=True)
+        return
+    if "--version" in args:
+        print(f"holdle-data skill v{VERSION}")
+        return
     if "--adjust" in args:
         i = args.index("--adjust")
         if i + 1 < len(args) and args[i + 1] in ADJUST_MAP:
@@ -424,6 +509,9 @@ def main():
     print(f"数据源: TickFlow 主用（月/周/日）→ Baostock 降级 · AkShare 财报 · 腾讯/新浪 实时")
     print(f"输出目录: {out_dir}")
     print("=" * 70)
+
+    # 版本自检（非阻塞，每天最多一次）
+    _check_update()
 
     name = code
     sym_tf = code_to_tickflow(code, market)
