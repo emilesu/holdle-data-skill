@@ -61,7 +61,7 @@ python3 holdle_data.py hk_00700 ~/holdle_data --adjust backward
 - `{代码}_月K_{复权}.csv` — 月K线 + DIF/DEA/MACD柱
 - `{代码}_周K_{复权}.csv` — 周K线 + MACD
 - `{代码}_日K_{复权}.csv` — 日K线 + MACD
-- `{代码}_财务_近20年.csv` — ROE/毛利率/净利率/现金流（A股）
+- `{代码}_财务_近20年.csv` — ROE/毛利率/净利率/现金流/负债率（A股/港股/美股）
 - 实时行情打印在终端
 
 ### Step 2：读取数据 + 调 MCP 检索方法论
@@ -99,7 +99,7 @@ monthly = pd.read_csv(f"{OUT}/{code}_月K_{adjust_label}.csv")
 | 数据 | 来源 | 说明 |
 |:--|:--|:--|
 | 月K/周K/日K | TickFlow（免费）→ Baostock 降级 | 后复权/前复权均支持 |
-| 财报 | AkShare（东方财富） | A股近20年 |
+| 财报 | AkShare（东方财富） | **A股/港股/美股** 近20年 |
 | 实时行情 | 腾讯（A/港）/ 新浪（美股） | |
 
 依赖：`pip3 install baostock tickflow akshare pandas`

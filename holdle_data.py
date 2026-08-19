@@ -58,7 +58,7 @@ except ImportError:
     ak = None
 
 # ── 版本与更新（2026-08-19 新增自更新机制） ──────
-VERSION = "1.0.0"                      # skill 包版本（与 version.json 对齐）
+VERSION = "1.0.1"                      # skill 包版本（与 version.json 对齐）
 VERSION_URL = "https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/version.json"
 VERSION_CHECK_INTERVAL = 86400         # 每天最多检查一次更新（秒）
 _UPDATE_MARKER = "HOLDLE_DATA_SKILL"   # 自更新安全标记
@@ -398,6 +398,84 @@ EM_INDICATORS = {
     'roa': '总资产报酬率(ROA)',
 }
 
+def fetch_financials_hk(code):
+    """港股财务核心指标（东方财富 stock_financial_hk_analysis_indicator_em），近 FIN_YEARS 年"""
+    if ak is None:
+        print("  ⚠️ akshare 未安装（pip3 install akshare），跳过财报")
+        return []
+    try:
+        df = ak.stock_financial_hk_analysis_indicator_em(symbol=code, indicator='年度')
+        if df is None or df.empty:
+            return []
+        # 按 REPORT_DATE 排序（新→旧），取最近 FIN_YEARS 年
+        df = df.sort_values('REPORT_DATE', ascending=False).head(FIN_YEARS)
+        import math
+        result = []
+        for _, row in df.iterrows():
+            year = str(row.get('REPORT_DATE', ''))[:4]
+            if not year.isdigit():
+                continue
+            def num(key):
+                v = row.get(key)
+                if v is None or (isinstance(v, float) and math.isnan(v)):
+                    return float('nan')
+                return float(v)
+            entry = {
+                '年份': year,
+                'roe': num('ROE_YEARLY'),
+                'gross_margin': num('GROSS_PROFIT_RATIO'),
+                'net_margin': num('NET_PROFIT_RATIO'),
+                'debt_ratio': num('DEBT_ASSET_RATIO'),
+                'net_profit': num('HOLDER_PROFIT') / 1e8 if row.get('HOLDER_PROFIT') else float('nan'),
+                'cash_flow': num('PER_NETCASH_OPERATE'),  # 每股经营现金流
+            }
+            result.append(entry)
+        return result
+    except Exception as e:
+        print(f"  ⚠️ 港股财报获取失败: {e}")
+        return []
+
+
+def fetch_financials_us(code):
+    """美股财务核心指标（东方财富 stock_financial_us_analysis_indicator_em），近 FIN_YEARS 年"""
+    if ak is None:
+        print("  ⚠️ akshare 未安装（pip3 install akshare），跳过财报")
+        return []
+    try:
+        df = ak.stock_financial_us_analysis_indicator_em(symbol=code, indicator='年报')
+        if df is None or df.empty:
+            return []
+        # 按 REPORT_DATE 排序（新→旧），取最近 FIN_YEARS 年
+        df = df.sort_values('REPORT_DATE', ascending=False).head(FIN_YEARS)
+        import math
+        result = []
+        for _, row in df.iterrows():
+            year = str(row.get('STD_REPORT_DATE', ''))[:4]
+            if not year.isdigit():
+                year = str(row.get('REPORT_DATE', ''))[:4]
+            if not year.isdigit():
+                continue
+            def num(key):
+                v = row.get(key)
+                if v is None or (isinstance(v, float) and math.isnan(v)):
+                    return float('nan')
+                return float(v)
+            entry = {
+                '年份': year,
+                'roe': num('ROE_AVG'),
+                'gross_margin': num('GROSS_PROFIT_RATIO'),
+                'net_margin': num('NET_PROFIT_RATIO'),
+                'debt_ratio': num('DEBT_ASSET_RATIO'),
+                'net_profit': num('PARENT_HOLDER_NETPROFIT') / 1e8 if row.get('PARENT_HOLDER_NETPROFIT') else float('nan'),
+                'cash_flow': float('nan'),  # 美股接口无直接现金流，后续补充
+            }
+            result.append(entry)
+        return result
+    except Exception as e:
+        print(f"  ⚠️ 美股财报获取失败: {e}")
+        return []
+
+
 def fetch_financials_a(code):
     """A股财务核心指标（东方财富 stock_financial_abstract），近 FIN_YEARS 年"""
     if ak is None:
@@ -536,26 +614,29 @@ def main():
         else:
             print("  ⚠️ 实时行情获取失败")
 
-    # ── 1. 财务核心指标（A股） ──────────────────
+    # ── 1. 财务核心指标（A股/港股/美股，近20年） ─
     print("\n[1/5] 财务核心指标（近20年）...")
+    fin = []
     if market == 'a':
         fin = fetch_financials_a(code)
-        if fin:
-            fdf = pd.DataFrame(fin)
-            want = ['年份', 'roe', 'roa', 'gross_margin', 'net_margin', 'net_profit', 'cash_flow', 'debt_ratio']
-            showf = fdf[[c for c in want if c in fdf.columns]].copy()
-            showf = showf.rename(columns={
-                'roe': 'ROE(%)', 'roa': 'ROA(%)', 'gross_margin': '毛利率(%)',
-                'net_margin': '净利率(%)', 'net_profit': '净利润(亿)', 'cash_flow': '经营现金流(亿)',
-                'debt_ratio': '负债率(%)'
-            })
-            showf.to_csv(f"{out_dir}/{code}_财务_近20年.csv", index=False)
-            print(f"  ✅ 已存 {code}_财务_近20年.csv")
-            print("\n" + showf.to_string(index=False))
-        else:
-            print("  ❌ 财报获取失败")
+    elif market == 'hk':
+        fin = fetch_financials_hk(code)
+    elif market == 'us':
+        fin = fetch_financials_us(code)
+    if fin:
+        fdf = pd.DataFrame(fin)
+        want = ['年份', 'roe', 'roa', 'gross_margin', 'net_margin', 'net_profit', 'cash_flow', 'debt_ratio']
+        showf = fdf[[c for c in want if c in fdf.columns]].copy()
+        showf = showf.rename(columns={
+            'roe': 'ROE(%)', 'roa': 'ROA(%)', 'gross_margin': '毛利率(%)',
+            'net_margin': '净利率(%)', 'net_profit': '净利润(亿)', 'cash_flow': '经营现金流(亿)',
+            'debt_ratio': '负债率(%)'
+        })
+        showf.to_csv(f"{out_dir}/{code}_财务_近20年.csv", index=False)
+        print(f"  ✅ 已存 {code}_财务_近20年.csv")
+        print("\n" + showf.to_string(index=False))
     else:
-        print("  ⚠️ 当前版本财报仅支持 A 股（港股/美股财务请查阅年报或后续版本）")
+        print("  ❌ 财报获取失败")
 
     # ── 2. 月K线（TickFlow 主用 → Baostock 降级） ─
     print("\n[2/5] 月K线（后复权）+ MACD...")
