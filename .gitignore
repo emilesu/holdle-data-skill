@@ -1,0 +1,6 @@
+# 本地运行痕迹不入库
+.version_check_stamp
+*.bak
+__pycache__/
+*.pyc
+.DS_Store
