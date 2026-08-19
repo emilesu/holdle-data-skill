@@ -59,7 +59,8 @@ except ImportError:
 
 # ── 版本与更新（2026-08-19 新增自更新机制） ──────
 VERSION = "1.0.1"                      # skill 包版本（与 version.json 对齐）
-VERSION_URL = "https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/version.json"
+VERSION_URL_API = "https://api.github.com/repos/emilesu/holdle-data-skill/contents/version.json"
+VERSION_URL_RAW = "https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/version.json"
 VERSION_CHECK_INTERVAL = 86400         # 每天最多检查一次更新（秒）
 _UPDATE_MARKER = "HOLDLE_DATA_SKILL"   # 自更新安全标记
 
@@ -95,11 +96,24 @@ def _check_update(force=False):
         except Exception:
             pass
 
+    import urllib.request as _urlreq
+    remote = None
+    # 优先 GitHub API（实时、无 CDN 缓存），失败降级 raw
     try:
-        import urllib.request as _urlreq
-        req = _urlreq.Request(VERSION_URL, headers={"User-Agent": "holdle-data/1.0"})
+        req = _urlreq.Request(VERSION_URL_API, headers={"User-Agent": "holdle-data/1.0"})
         with _urlreq.urlopen(req, timeout=8) as resp:
-            remote = _json.loads(resp.read().decode("utf-8"))
+            api_data = _json.loads(resp.read().decode("utf-8"))
+            content = _json.loads(__import__("base64").b64decode(api_data.get("content", "")).decode("utf-8"))
+            remote = content
+    except Exception:
+        try:
+            req = _urlreq.Request(VERSION_URL_RAW, headers={"User-Agent": "holdle-data/1.0"})
+            with _urlreq.urlopen(req, timeout=8) as resp:
+                remote = _json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            print(f"  ⚠️ 版本检查失败（{e}），继续使用本地版本")
+            return
+    if remote:
         remote_ver = remote.get("version", "")
         # 写时间戳
         try:
@@ -113,20 +127,31 @@ def _check_update(force=False):
             _auto_update(remote_ver)
         else:
             print(f"  ✅ 已是最新版本 v{VERSION}")
-    except Exception as e:
-        # 检查失败不阻塞主流程
-        print(f"  ⚠️ 版本检查失败（{e}），继续使用本地版本")
 
 
 def _auto_update(new_ver):
     """自动下载新版脚本覆盖自己（A+C 方案）。从固定 HTTPS URL 下载。"""
     import urllib.request as _urlreq
+    import base64 as _b64
 
-    script_url = "https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/holdle_data.py"
+    script_url_api = "https://api.github.com/repos/emilesu/holdle-data-skill/contents/holdle_data.py"
+    script_url_raw = "https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/holdle_data.py"
+    content = None
+    # 优先 GitHub API（实时无缓存），失败降级 raw
     try:
-        req = _urlreq.Request(script_url, headers={"User-Agent": "holdle-data/1.0"})
+        req = _urlreq.Request(script_url_api, headers={"User-Agent": "holdle-data/1.0"})
         with _urlreq.urlopen(req, timeout=15) as resp:
-            content = resp.read()
+            api_data = _json.loads(resp.read().decode("utf-8"))
+            content = _b64.b64decode(api_data.get("content", "") or "")
+    except Exception:
+        try:
+            req = _urlreq.Request(script_url_raw, headers={"User-Agent": "holdle-data/1.0"})
+            with _urlreq.urlopen(req, timeout=15) as resp:
+                content = resp.read()
+        except Exception as e:
+            print(f"  ❌ 自动更新失败（{e}），请手动更新：git pull 或重新下载")
+            return
+    try:
         # 安全校验：必须是我们的脚本（含更新标记 + VERSION 声明）
         text = content.decode("utf-8", errors="ignore")
         if _UPDATE_MARKER not in text or "VERSION =" not in text:
