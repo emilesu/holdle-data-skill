@@ -102,7 +102,7 @@ monthly = pd.read_csv(f"{OUT}/{code}_月K_{adjust_label}.csv")
 | 财报 | AkShare（东方财富） | **A股/港股/美股** 近20年 |
 | 实时行情 | 腾讯（A/港）/ 新浪（美股） | |
 
-依赖：`pip3 install baostock tickflow akshare pandas`
+依赖：先检查 `python3 -c "import baostock, tickflow, akshare, pandas"`，缺哪个装哪个（`pip3 install <缺的包>`）
 
 ---
 
@@ -131,6 +131,6 @@ monthly = pd.read_csv(f"{OUT}/{code}_月K_{adjust_label}.csv")
 
 ## 七、常见问题
 
-- **数据拉取失败？** 先检查是否版本过旧（运行 `--update`），再查网络 + 依赖（`pip3 install baostock tickflow akshare pandas`）
+- **数据拉取失败？** 先检查是否版本过旧（运行 `--update`），再查网络 + 依赖（先检查再装，见上文）
 - **代码识别不了？** A股用6位数字，美股用字母代码（NVDA），港股加 hk_ 前缀（hk_00700）
 - **历史数据缺失？** 后复权模式（默认）数据最全；前复权可能因分红送股导致早期数据被压缩
