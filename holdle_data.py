@@ -61,6 +61,11 @@ except ImportError:
 VERSION = "1.0.1"                      # skill 包版本（与 version.json 对齐）
 VERSION_URL_API = "https://api.github.com/repos/emilesu/holdle-data-skill/contents/version.json"
 VERSION_URL_RAW = "https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/version.json"
+# 国内镜像源（2026-08-20 新增：raw.githubusercontent 国内不稳定，按序 fallback）
+VERSION_URL_CDN = "https://cdn.jsdelivr.net/gh/emilesu/holdle-data-skill@master/version.json"
+SCRIPT_URL_CDN = "https://cdn.jsdelivr.net/gh/emilesu/holdle-data-skill@master/holdle_data.py"
+SCRIPT_URL_PROXY = "https://ghproxy.net/https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/holdle_data.py"
+VERSION_URL_PROXY = "https://ghproxy.net/https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/version.json"
 VERSION_CHECK_INTERVAL = 86400         # 每天最多检查一次更新（秒）
 _UPDATE_MARKER = "HOLDLE_DATA_SKILL"   # 自更新安全标记
 
@@ -106,12 +111,17 @@ def _check_update(force=False):
             content = _json.loads(__import__("base64").b64decode(api_data.get("content", "")).decode("utf-8"))
             remote = content
     except Exception:
-        try:
-            req = _urlreq.Request(VERSION_URL_RAW, headers={"User-Agent": "holdle-data/1.0"})
-            with _urlreq.urlopen(req, timeout=8) as resp:
-                remote = _json.loads(resp.read().decode("utf-8"))
-        except Exception as e:
-            print(f"  ⚠️ 版本检查失败（{e}），继续使用本地版本")
+        # 国内镜像 fallback：jsDelivr CDN → ghproxy → raw
+        for url in (VERSION_URL_CDN, VERSION_URL_PROXY, VERSION_URL_RAW):
+            try:
+                req = _urlreq.Request(url, headers={"User-Agent": "holdle-data/1.0"})
+                with _urlreq.urlopen(req, timeout=8) as resp:
+                    remote = _json.loads(resp.read().decode("utf-8"))
+                    break
+            except Exception:
+                continue
+        if remote is None:
+            print("  ⚠️ 版本检查失败（所有源不可达），继续使用本地版本")
             return
     if remote:
         remote_ver = remote.get("version", "")
@@ -144,12 +154,17 @@ def _auto_update(new_ver):
             api_data = _json.loads(resp.read().decode("utf-8"))
             content = _b64.b64decode(api_data.get("content", "") or "")
     except Exception:
-        try:
-            req = _urlreq.Request(script_url_raw, headers={"User-Agent": "holdle-data/1.0"})
-            with _urlreq.urlopen(req, timeout=15) as resp:
-                content = resp.read()
-        except Exception as e:
-            print(f"  ❌ 自动更新失败（{e}），请手动更新：git pull 或重新下载")
+        # 国内镜像 fallback：jsDelivr CDN → ghproxy → raw
+        for url in (SCRIPT_URL_CDN, SCRIPT_URL_PROXY, script_url_raw):
+            try:
+                req = _urlreq.Request(url, headers={"User-Agent": "holdle-data/1.0"})
+                with _urlreq.urlopen(req, timeout=15) as resp:
+                    content = resp.read()
+                    break
+            except Exception:
+                continue
+        if content is None:
+            print(f"  ❌ 自动更新失败（所有源不可达），请手动更新：git pull 或重新下载")
             return
     try:
         # 安全校验：必须是我们的脚本（含更新标记 + VERSION 声明）
