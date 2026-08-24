@@ -109,20 +109,24 @@ monthly = pd.read_csv(f"{OUT}/{code}_月K_{adjust_label}.csv")
 
 ## 六、版本更新（重要）
 
-**脚本自带自更新机制**（2026-08-19 起）：
+**脚本自带版本检查机制**（2026-08-19 起，2026-08-25 安全加固）：
 
 1. **每次运行自动检查**（每天最多一次）：脚本启动时会对比 GitHub 远程版本
-2. **有新版本** → 脚本自动下载新版覆盖自己 → 提示重新运行
-3. 如果自动更新失败，手动更新：
+2. **有新版本** → 脚本**只提示**，不会自动下载覆盖（v1.0.2 起，默认关闭自动覆盖）
+3. 如需自动更新（⚠️ 会覆盖脚本文件，请确认来源可信）：
+   ```bash
+   python3 holdle_data.py --auto-update   # 自动下载并覆盖
+   ```
+4. 手动更新（推荐）：
    ```bash
    cd <holdle-data-skill目录>
    git pull            # 如果当初是 git clone 的
    # 或
-   python3 holdle_data.py --update
+   python3 holdle_data.py --update        # 仅检查，提示版本信息
    ```
 
 **作为 agent 的职责：**
-- 如果脚本输出「检测到新版本」提示，**帮用户执行更新**（`python3 holdle_data.py --update` 或 git pull）
+- 如果脚本输出「检测到新版本」提示，**提醒用户更新**，建议使用 `git pull` 或 `python3 holdle_data.py --auto-update`
 - 更新后重新运行脚本，确认数据正常
 - 不要忽视版本提示（旧版可能因数据源接口变化而报错）
 

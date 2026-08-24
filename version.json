@@ -1,5 +1,5 @@
 {
-  "version": "1.0.1",
-  "changelog": "v1.0.1：财报三市场支持（A/港/美近20年）；修复月K前复权未生效 bug",
-  "updated": "2026-08-19"
+  "version": "1.0.2",
+  "changelog": "v1.0.2：【安全修复】1) 修复月K复权口径漏传参数（--adjust forward 月K实际拿到后复权数据）；2) 修复月K/周K _drop_partial_last 返回值被丢弃（进行中K线未剔除）；3) 自更新机制加固：默认只提示不自动覆盖，需 --auto-update 才自动；4) 移除 ghproxy.net 第三方代理防 MITM；5) 增强安全校验（多标记组合验证）",
+  "updated": "2026-08-25"
 }

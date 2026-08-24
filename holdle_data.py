@@ -57,17 +57,20 @@ try:
 except ImportError:
     ak = None
 
-# ── 版本与更新（2026-08-19 新增自更新机制） ──────
-VERSION = "1.0.1"                      # skill 包版本（与 version.json 对齐）
+# ── 版本与更新（2026-08-19 新增自更新机制，2026-08-25 安全加固） ──────
+VERSION = "1.0.2"                      # skill 包版本（与 version.json 对齐）
 VERSION_URL_API = "https://api.github.com/repos/emilesu/holdle-data-skill/contents/version.json"
 VERSION_URL_RAW = "https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/version.json"
-# 国内镜像源（2026-08-20 新增：raw.githubusercontent 国内不稳定，按序 fallback）
+# 国内镜像源（仅 jsDelivr CDN；ghproxy.net 第三方代理已移除，MITM 风险）
 VERSION_URL_CDN = "https://cdn.jsdelivr.net/gh/emilesu/holdle-data-skill@master/version.json"
 SCRIPT_URL_CDN = "https://cdn.jsdelivr.net/gh/emilesu/holdle-data-skill@master/holdle_data.py"
-SCRIPT_URL_PROXY = "https://ghproxy.net/https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/holdle_data.py"
-VERSION_URL_PROXY = "https://ghproxy.net/https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/version.json"
 VERSION_CHECK_INTERVAL = 86400         # 每天最多检查一次更新（秒）
-_UPDATE_MARKER = "HOLDLE_DATA_SKILL"   # 自更新安全标记
+# 安全校验标记（必须同时存在才视为合法脚本）
+_UPDATE_MARKERS = (
+    "HOLDLE_DATA_SKILL",               # 自更新安全标记
+    "HOLDLE 行情数据获取",              # 脚本身份标识
+    'VERSION = "1.',                    # 版本声明格式
+)
 
 # ── 配置 ──────────────────────────────────────────
 MAX_RETRIES = 3
@@ -85,10 +88,11 @@ DEFAULT_ADJUST = "backward"
 
 
 # ═══════════════════════════════════════════════════
-#  版本自检与更新（A+C 方案：脚本自检 + 自动更新）
+#  版本自检与更新（v1.2 安全加固：默认只提示，需 --auto-update 才自动覆盖）
 # ═══════════════════════════════════════════════════
-def _check_update(force=False):
-    """检查是否有新版本。每天最多一次（本地时间戳）。force=True 强制检查。"""
+def _check_update(force=False, auto=False):
+    """检查是否有新版本。每天最多一次（本地时间戳）。force=True 强制检查。
+    auto=True 才自动下载覆盖；默认只提示用户手动更新。"""
     import json as _json
     import time as _time
 
@@ -103,7 +107,7 @@ def _check_update(force=False):
 
     import urllib.request as _urlreq
     remote = None
-    # 优先 GitHub API（实时、无 CDN 缓存），失败降级 raw
+    # 优先 GitHub API（实时、无 CDN 缓存），失败降级 jsDelivr CDN
     try:
         req = _urlreq.Request(VERSION_URL_API, headers={"User-Agent": "holdle-data/1.0"})
         with _urlreq.urlopen(req, timeout=8) as resp:
@@ -111,8 +115,8 @@ def _check_update(force=False):
             content = _json.loads(__import__("base64").b64decode(api_data.get("content", "")).decode("utf-8"))
             remote = content
     except Exception:
-        # 国内镜像 fallback：jsDelivr CDN → ghproxy → raw
-        for url in (VERSION_URL_CDN, VERSION_URL_PROXY, VERSION_URL_RAW):
+        # 国内镜像 fallback：仅 jsDelivr CDN（ghproxy.net 已移除，防 MITM）
+        for url in (VERSION_URL_CDN, VERSION_URL_RAW):
             try:
                 req = _urlreq.Request(url, headers={"User-Agent": "holdle-data/1.0"})
                 with _urlreq.urlopen(req, timeout=8) as resp:
@@ -133,29 +137,34 @@ def _check_update(force=False):
         if remote_ver != VERSION:
             print(f"\n  🔄 检测到新版本 v{remote_ver}（当前 v{VERSION}）")
             print(f"     更新说明: {remote.get('changelog', '')}")
-            print(f"     正在自动更新...")
-            _auto_update(remote_ver)
+            if auto:
+                print(f"     正在自动更新...")
+                _auto_update(remote_ver)
+            else:
+                print(f"     ⚠️ 请手动更新（自动覆盖已关闭）：")
+                print(f"       python3 holdle_data.py --update")
+                print(f"       或: cd <skill目录> && git pull")
         else:
             print(f"  ✅ 已是最新版本 v{VERSION}")
 
 
 def _auto_update(new_ver):
-    """自动下载新版脚本覆盖自己（A+C 方案）。从固定 HTTPS URL 下载。"""
+    """自动下载新版脚本覆盖自己。从固定 HTTPS URL 下载。"""
     import urllib.request as _urlreq
     import base64 as _b64
 
     script_url_api = "https://api.github.com/repos/emilesu/holdle-data-skill/contents/holdle_data.py"
     script_url_raw = "https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/holdle_data.py"
     content = None
-    # 优先 GitHub API（实时无缓存），失败降级 raw
+    # 优先 GitHub API（实时无缓存），失败降级 jsDelivr CDN
     try:
         req = _urlreq.Request(script_url_api, headers={"User-Agent": "holdle-data/1.0"})
         with _urlreq.urlopen(req, timeout=15) as resp:
             api_data = _json.loads(resp.read().decode("utf-8"))
             content = _b64.b64decode(api_data.get("content", "") or "")
     except Exception:
-        # 国内镜像 fallback：jsDelivr CDN → ghproxy → raw
-        for url in (SCRIPT_URL_CDN, SCRIPT_URL_PROXY, script_url_raw):
+        # 国内镜像 fallback：仅 jsDelivr CDN（ghproxy.net 已移除，防 MITM）
+        for url in (SCRIPT_URL_CDN, script_url_raw):
             try:
                 req = _urlreq.Request(url, headers={"User-Agent": "holdle-data/1.0"})
                 with _urlreq.urlopen(req, timeout=15) as resp:
@@ -167,11 +176,12 @@ def _auto_update(new_ver):
             print(f"  ❌ 自动更新失败（所有源不可达），请手动更新：git pull 或重新下载")
             return
     try:
-        # 安全校验：必须是我们的脚本（含更新标记 + VERSION 声明）
+        # 安全校验：必须同时包含所有身份标记（缺任一则拒绝）
         text = content.decode("utf-8", errors="ignore")
-        if _UPDATE_MARKER not in text or "VERSION =" not in text:
-            print("  ❌ 下载内容校验失败（非 HOLDLE 脚本），已中止更新")
-            return
+        for marker in _UPDATE_MARKERS:
+            if marker not in text:
+                print(f"  ❌ 下载内容校验失败（缺少标记: {marker}），已中止更新")
+                return
         # 备份当前 + 写入新版
         self_path = os.path.abspath(__file__)
         backup = self_path + ".bak"
@@ -278,7 +288,7 @@ def fetch_tickflow_monthly(symbol_tf, drop_partial=True, adjust="backward"):
         if df.empty:
             return df
         if drop_partial:
-            _drop_partial_last(df, datetime.now(), 'M')
+            df = _drop_partial_last(df, datetime.now(), 'M')
         return df
     except Exception as e:
         print(f"  ⚠️ TickFlow 月K异常: {e}")
@@ -297,7 +307,7 @@ def fetch_tickflow_weekly(symbol_tf, drop_partial=True, adjust="backward"):
         if df.empty:
             return df
         if drop_partial:
-            _drop_partial_last(df, datetime.now(), 'w')
+            df = _drop_partial_last(df, datetime.now(), 'w')
         return df
     except Exception as e:
         print(f"  ⚠️ TickFlow 周K异常: {e}")
@@ -583,15 +593,19 @@ def main():
         print("  美股示例:  NVDA    AAPL    MSFT")
         print("  港股示例:  hk_00700  hk_09988")
         print("  --adjust: backward=后复权(默认,历史复盘/回测) forward=前复权(当前时点判断)")
-        print("  --update: 检查并自动更新到最新版")
+        print("  --update: 检查更新（仅提示）")
+        print("  --auto-update: 检查并自动下载覆盖（⚠️ 覆盖脚本文件，请确认来源可信）")
         print("  --version: 显示当前版本")
         sys.exit(1)
 
-    # 解析 --adjust / --update / --check-update
+    # 解析 --adjust / --update / --auto-update / --check-update
     adjust = DEFAULT_ADJUST
     args = sys.argv[1:]
+    if "--auto-update" in args:
+        _check_update(force=True, auto=True)
+        return
     if "--update" in args or "--check-update" in args:
-        _check_update(force=True)
+        _check_update(force=True, auto=False)
         return
     if "--version" in args:
         print(f"holdle-data skill v{VERSION}")
@@ -628,8 +642,8 @@ def main():
     print(f"输出目录: {out_dir}")
     print("=" * 70)
 
-    # 版本自检（非阻塞，每天最多一次）
-    _check_update()
+    # 版本自检（非阻塞，每天最多一次；默认只提示，不自动覆盖）
+    _check_update(auto=False)
 
     name = code
     sym_tf = code_to_tickflow(code, market)
@@ -679,8 +693,8 @@ def main():
         print("  ❌ 财报获取失败")
 
     # ── 2. 月K线（TickFlow 主用 → Baostock 降级） ─
-    print("\n[2/5] 月K线（后复权）+ MACD...")
-    monthly = fetch_tickflow_monthly(sym_tf)
+    print(f"\n[2/5] 月K线（{adj_label}）+ MACD...")
+    monthly = fetch_tickflow_monthly(sym_tf, adjust=adj_tf)
     monthly_src = 'TickFlow'
     if monthly.empty and bs_code:
         print("  ⚠️ TickFlow 月K不可用，降级到 Baostock...")
@@ -702,7 +716,7 @@ def main():
         print("  ❌ 月K获取失败")
 
     # ── 3. 周K线（TickFlow 主用 → Baostock 降级） ─
-    print("\n[3/5] 周K线（后复权）+ MACD...")
+    print(f"\n[3/5] 周K线（{adj_label}）+ MACD...")
     weekly = fetch_tickflow_weekly(sym_tf, adjust=adj_tf)
     if weekly.empty and bs_code:
         print("  ⚠️ TickFlow 周K不可用，降级到 Baostock...")
@@ -719,7 +733,7 @@ def main():
         print("  ⚠️ 周K获取失败")
 
     # ── 4. 日K线（TickFlow） ────────────────────
-    print("\n[4/5] 日K线（TickFlow Free，后复权）+ MACD...")
+    print(f"\n[4/5] 日K线（TickFlow Free，{adj_label}）+ MACD...")
     daily = fetch_tickflow_daily(sym_tf, adjust=adj_tf)
     if not daily.empty:
         dif, dea, mbar = calc_macd(daily)
