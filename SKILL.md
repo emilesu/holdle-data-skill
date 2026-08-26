@@ -74,6 +74,7 @@ monthly = pd.read_csv(f"{OUT}/{code}_月K_{adjust_label}.csv")
 ```
 
 同时调用 **holdle_ask** 工具检索方法论片段（如「状态A判断」「入场流程」「交易管理」）。
+调用 **holdle_get_rules** 获取校准规则时，传与 holdle_ask 相同的 `round_id`，同一次提问只扣 1 次。
 
 ### Step 3：结合分析并输出
 

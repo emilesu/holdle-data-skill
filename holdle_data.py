@@ -92,7 +92,11 @@ DEFAULT_ADJUST = "backward"
 # ═══════════════════════════════════════════════════
 def _check_update(force=False, auto=False):
     """检查是否有新版本。每天最多一次（本地时间戳）。force=True 强制检查。
-    auto=True 才自动下载覆盖；默认只提示用户手动更新。"""
+    auto=True 才自动下载覆盖；默认只提示用户手动更新。
+
+    多进程说明：时间戳文件无文件锁，并发调用时可能出现两个实例同时读到「未检查」
+    并同时执行检查。实际危害极低（多查一次远程版本，结果相同），无需加锁。
+    如果未来改为自动覆盖（auto=True），建议用 fcntl.flock 或 rename 原子操作防竞争。"""
     import json as _json
     import time as _time
 
@@ -182,7 +186,7 @@ def _auto_update(new_ver):
             if marker not in text:
                 print(f"  ❌ 下载内容校验失败（缺少标记: {marker}），已中止更新")
                 return
-        # 备份当前 + 写入新版
+        # 备份当前 + 写入新版 + 清理旧备份
         self_path = os.path.abspath(__file__)
         backup = self_path + ".bak"
         try:
@@ -192,6 +196,16 @@ def _auto_update(new_ver):
             pass
         with open(self_path, "wb") as f:
             f.write(content)
+        # 清理旧备份（只保留最新一个）
+        old_backups = [f for f in os.listdir(os.path.dirname(self_path))
+                       if f.startswith(os.path.basename(self_path)) and f.endswith(".bak")]
+        for old in old_backups:
+            old_path = os.path.join(os.path.dirname(self_path), old)
+            if old_path != backup:
+                try:
+                    os.remove(old_path)
+                except Exception:
+                    pass
         print(f"  ✅ 已更新到 v{new_ver}（旧版备份: {os.path.basename(backup)}）")
         print(f"     请重新运行本脚本。")
         sys.exit(0)
