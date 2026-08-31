@@ -58,7 +58,7 @@ except ImportError:
     ak = None
 
 # ── 版本与更新（2026-08-19 新增自更新机制，2026-08-25 安全加固） ──────
-VERSION = "1.0.2"                      # skill 包版本（与 version.json 对齐）
+VERSION = "1.0.3"                      # skill 包版本（与 version.json 对齐）
 VERSION_URL_API = "https://api.github.com/repos/emilesu/holdle-data-skill/contents/version.json"
 VERSION_URL_RAW = "https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/version.json"
 # 国内镜像源（仅 jsDelivr CDN；ghproxy.net 第三方代理已移除，MITM 风险）
@@ -452,14 +452,16 @@ def fetch_sina_us_realtime(symbol):
 # ═══════════════════════════════════════════════════
 #  数据源：财报（A股，东方财富，近20年）
 # ═══════════════════════════════════════════════════
+# 每个字段支持多个备选指标名（按序匹配第一个命中；兼容 akshare/数据源版本差异，
+# 例如旧版新浪接口可能返回「经营活动产生的现金流量净额」而非「经营现金流量净额」）
 EM_INDICATORS = {
-    'roe': '净资产收益率(ROE)',
-    'gross_margin': '毛利率',
-    'net_margin': '销售净利率',
-    'debt_ratio': '资产负债率',
-    'cash_flow': '经营现金流量净额',
-    'net_profit': '净利润',
-    'roa': '总资产报酬率(ROA)',
+    'roe': ['净资产收益率(ROE)', '净资产收益率'],
+    'gross_margin': ['毛利率'],
+    'net_margin': ['销售净利率'],
+    'debt_ratio': ['资产负债率'],
+    'cash_flow': ['经营现金流量净额', '经营活动产生的现金流量净额'],
+    'net_profit': ['净利润', '归母净利润'],
+    'roa': ['总资产报酬率(ROA)', '总资产报酬率'],
 }
 
 def fetch_financials_hk(code):
@@ -501,7 +503,7 @@ def fetch_financials_hk(code):
 
 
 def fetch_financials_us(code):
-    """美股财务核心指标（东方财富 stock_financial_us_analysis_indicator_em），近 FIN_YEARS 年"""
+    """美股财务核心指标（东方财富分析指标 + 现金流量表），近 FIN_YEARS 年"""
     if ak is None:
         print("  ⚠️ akshare 未安装（pip3 install akshare），跳过财报")
         return []
@@ -512,6 +514,18 @@ def fetch_financials_us(code):
         # 按 REPORT_DATE 排序（新→旧），取最近 FIN_YEARS 年
         df = df.sort_values('REPORT_DATE', ascending=False).head(FIN_YEARS)
         import math
+        # 经营现金流（元）：美股分析指标接口无该字段，改用东财美股现金流量表补充
+        ocf_by_year = {}
+        try:
+            cf_df = ak.stock_financial_us_report_em(stock=code, symbol='现金流量表', indicator='年报')
+            ocf = cf_df[cf_df['ITEM_NAME'] == '经营活动产生的现金流量净额']
+            for _, r in ocf.iterrows():
+                y = str(r.get('REPORT_DATE', ''))[:4]
+                v = r.get('AMOUNT')
+                if y.isdigit() and v is not None and not (isinstance(v, float) and math.isnan(v)):
+                    ocf_by_year[y] = float(v)
+        except Exception as e:
+            print(f"  ⚠️ 美股现金流量表获取失败，经营现金流留空: {e}")
         result = []
         for _, row in df.iterrows():
             year = str(row.get('STD_REPORT_DATE', ''))[:4]
@@ -531,7 +545,8 @@ def fetch_financials_us(code):
                 'net_margin': num('NET_PROFIT_RATIO'),
                 'debt_ratio': num('DEBT_ASSET_RATIO'),
                 'net_profit': num('PARENT_HOLDER_NETPROFIT') / 1e8 if row.get('PARENT_HOLDER_NETPROFIT') else float('nan'),
-                'cash_flow': float('nan'),  # 美股接口无直接现金流，后续补充
+                # 经营现金流：美股现金流量表「经营活动产生的现金流量净额」（元→亿）
+                'cash_flow': ocf_by_year[year] / 1e8 if year in ocf_by_year else float('nan'),
             }
             result.append(entry)
         return result
@@ -540,8 +555,67 @@ def fetch_financials_us(code):
         return []
 
 
+def _parse_ths_num(s):
+    """解析同花顺字符串数值（'5679.18万'/'4.52亿'/'23.24%'/'0.42'）→ float。
+
+    口径对齐主接口：百分比字段（ROE/毛利率/净利率/负债率）返回百分比数值（23.24%→23.24），
+    与新浪接口的 ROE(%) 等列一致；绝对字段（净利润/每股经营现金流）返回元。"""
+    if s is None:
+        return float('nan')
+    s = str(s).strip()
+    if s in ('', 'nan', 'None', '-', '--'):
+        return float('nan')
+    if s.endswith('%'):
+        s = s[:-1]
+        mult = 1.0  # 百分比保留数值本身（23.24%→23.24），与主接口 ROE(%) 列口径一致
+    elif s.endswith('万亿'):
+        mult = 1e12
+        s = s[:-2]
+    elif s.endswith('亿'):
+        mult = 1e8
+        s = s[:-1]
+    elif s.endswith('万'):
+        mult = 1e4
+        s = s[:-1]
+    else:
+        mult = 1.0
+    try:
+        return float(s) * mult
+    except Exception:
+        return float('nan')
+
+
+def fetch_financials_a_ths(code):
+    """A股财务降级（同花顺 stock_financial_abstract_ths，北交所/主接口失败时兜底）。
+
+    输出与 fetch_financials_a 一致的 entry 结构（年份/roe/roa/gross_margin/net_margin/
+    net_profit/cash_flow/debt_ratio），避免旧实现直接返回原始 dict 导致
+    CSV 字段全部对不上、经营现金流等指标「数据未覆盖」为空。"""
+    fin_df = ak.stock_financial_abstract_ths(symbol=code)
+    fin_df = fin_df[fin_df['报告期'].str.contains('12-31', na=False)].tail(FIN_YEARS)
+    import math
+    result = []
+    for _, row in fin_df.iterrows():
+        year = str(row.get('报告期', ''))[:4]
+        if not year.isdigit():
+            continue
+        entry = {
+            '年份': year,
+            'roe': _parse_ths_num(row.get('净资产收益率')),
+            'gross_margin': _parse_ths_num(row.get('销售毛利率')),
+            'net_margin': _parse_ths_num(row.get('销售净利率')),
+            'debt_ratio': _parse_ths_num(row.get('资产负债率')),
+            # 同花顺关键指标无经营现金流总额，用每股经营现金流（元/股）兜底，语义与港股/美股分支一致
+            'cash_flow': _parse_ths_num(row.get('每股经营现金流')),
+            'net_profit': _parse_ths_num(row.get('净利润')) / 1e8,  # 元 → 亿
+            'roa': float('nan'),  # 同花顺关键指标无 ROA，留空（主接口正常时不受影响）
+        }
+        result.append(entry)
+    return result
+
+
 def fetch_financials_a(code):
-    """A股财务核心指标（东方财富 stock_financial_abstract），近 FIN_YEARS 年"""
+    """A股财务核心指标（新浪 stock_financial_abstract，近 FIN_YEARS 年；失败降级同花顺）"""
     if ak is None:
         print("  ⚠️ akshare 未安装（pip3 install akshare），跳过财报")
         return []
@@ -551,10 +625,12 @@ def fetch_financials_a(code):
         year_cols = [c for c in date_cols if c.endswith('1231') and len(c) == 8 and c[:4].isdigit()]
         year_cols.sort()
         indicators = {}
-        for key, label in EM_INDICATORS.items():
-            row = df[df['指标'] == label]
-            if not row.empty:
-                indicators[key] = row.iloc[0]
+        for key, labels in EM_INDICATORS.items():
+            for label in labels:
+                row = df[df['指标'] == label]
+                if not row.empty:
+                    indicators[key] = row.iloc[0]
+                    break
         import math
         result = []
         for c in year_cols[-FIN_YEARS:]:
@@ -575,11 +651,9 @@ def fetch_financials_a(code):
             result.append(entry)
         return result
     except Exception as e:
-        print(f"  ⚠️ 东方财富财报获取失败: {e}")
+        print(f"  ⚠️ 新浪财报获取失败，降级同花顺: {e}")
         try:
-            fin_df = ak.stock_financial_abstract_ths(symbol=code)
-            fin_df = fin_df[fin_df['报告期'].str.contains('12-31', na=False)].tail(FIN_YEARS)
-            return fin_df.to_dict('records')
+            return fetch_financials_a_ths(code)
         except Exception:
             return []
 
