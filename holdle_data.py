@@ -58,7 +58,7 @@ except ImportError:
     ak = None
 
 # ── 版本与更新（2026-08-19 新增自更新机制，2026-08-25 安全加固） ──────
-VERSION = "1.0.3"                      # skill 包版本（与 version.json 对齐）
+VERSION = "1.0.4"                      # skill 包版本（与 version.json 对齐）
 VERSION_URL_API = "https://api.github.com/repos/emilesu/holdle-data-skill/contents/version.json"
 VERSION_URL_RAW = "https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/version.json"
 # 国内镜像源（仅 jsDelivr CDN；ghproxy.net 第三方代理已移除，MITM 风险）
@@ -90,13 +90,23 @@ DEFAULT_ADJUST = "backward"
 # ═══════════════════════════════════════════════════
 #  版本自检与更新（v1.2 安全加固：默认只提示，需 --auto-update 才自动覆盖）
 # ═══════════════════════════════════════════════════
+def _ver_cmp(a, b):
+    """版本号字符串比较（1.10 > 1.9）。返回 1/0/-1。"""
+    def norm(v):
+        parts = [int(x) for x in re.split(r'[._-]', str(v)) if x.isdigit()]
+        return parts or [0]
+    na, nb = norm(a), norm(b)
+    return (na > nb) - (na < nb)
+
+
 def _check_update(force=False, auto=False):
-    """检查是否有新版本。每天最多一次（本地时间戳）。force=True 强制检查。
-    auto=True 才自动下载覆盖；默认只提示用户手动更新。
+    """检查是否有新版本。force=True 强制检查（绕过每日限流）；auto=True 自动下载覆盖。
 
     多进程说明：时间戳文件无文件锁，并发调用时可能出现两个实例同时读到「未检查」
     并同时执行检查。实际危害极低（多查一次远程版本，结果相同），无需加锁。
-    如果未来改为自动覆盖（auto=True），建议用 fcntl.flock 或 rename 原子操作防竞争。"""
+    自动更新前会校验下载内容（_UPDATE_MARKERS）+ 备份旧版（.bak）；
+    环境变量 HOLDLE_DATA_UPDATED=1 表示本次运行已完成一次自动更新，重启后跳过，
+    防止版本比较异常导致无限重启。"""
     import json as _json
     import time as _time
 
@@ -138,24 +148,33 @@ def _check_update(force=False, auto=False):
             open(stamp_file, "w").write(str(_time.time()))
         except Exception:
             pass
-        if remote_ver != VERSION:
+        cmp_ = _ver_cmp(remote_ver, VERSION)
+        if cmp_ > 0:
             print(f"\n  🔄 检测到新版本 v{remote_ver}（当前 v{VERSION}）")
             print(f"     更新说明: {remote.get('changelog', '')}")
             if auto:
-                print(f"     正在自动更新...")
-                _auto_update(remote_ver)
+                if os.environ.get("HOLDLE_DATA_UPDATED") == "1":
+                    print("     ⚠️ 本次已自动更新过（防循环跳过），继续使用本地版本")
+                else:
+                    print(f"     正在自动更新，完成后自动重启继续本次任务...")
+                    _auto_update(remote_ver, restart=True)
             else:
-                print(f"     ⚠️ 请手动更新（自动覆盖已关闭）：")
-                print(f"       python3 holdle_data.py --update")
+                print(f"     ⚠️ 检测到新版本，请执行更新（自动覆盖已关闭）：")
+                print(f"       python3 holdle_data.py --auto-update")
                 print(f"       或: cd <skill目录> && git pull")
+        elif cmp_ < 0:
+            print(f"  ℹ️ 远程版本 v{remote_ver} 不高于本地 v{VERSION}（远程较旧，忽略）")
         else:
             print(f"  ✅ 已是最新版本 v{VERSION}")
 
 
-def _auto_update(new_ver):
-    """自动下载新版脚本覆盖自己。从固定 HTTPS URL 下载。"""
+def _auto_update(new_ver, restart=True):
+    """自动下载新版脚本覆盖自己。从固定 HTTPS URL 下载。
+    restart=True 时更新完成后用 os.execv 以新版代码重启继续本次任务；
+    restart=False 时更新完成后退出（供 --auto-update 显式命令使用）。"""
     import urllib.request as _urlreq
     import base64 as _b64
+    import json as _json  # v1.0.4 修复：此前漏 import 导致 GitHub API 段 NameError，静默降级 CDN 缓存旧版
 
     script_url_api = "https://api.github.com/repos/emilesu/holdle-data-skill/contents/holdle_data.py"
     script_url_raw = "https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/holdle_data.py"
@@ -186,6 +205,13 @@ def _auto_update(new_ver):
             if marker not in text:
                 print(f"  ❌ 下载内容校验失败（缺少标记: {marker}），已中止更新")
                 return
+        # 版本一致性校验（v1.0.4+）：下载内容的 VERSION 必须与期望版本一致。
+        # 防 CDN 缓存不同步（如 jsDelivr 缓存滞后于 GitHub API）导致「更新」实际拿到旧代码。
+        m = re.search(r'VERSION = "([\d.]+)"', text)
+        if m and m.group(1) != new_ver:
+            print(f"  ❌ 下载内容版本 v{m.group(1)} ≠ 期望 v{new_ver}（下载源缓存可能未刷新），已中止更新")
+            print(f"     请稍后重试（等 CDN 刷新），或手动更新：git pull")
+            return
         # 备份当前 + 写入新版 + 清理旧备份
         self_path = os.path.abspath(__file__)
         backup = self_path + ".bak"
@@ -207,8 +233,19 @@ def _auto_update(new_ver):
                 except Exception:
                     pass
         print(f"  ✅ 已更新到 v{new_ver}（旧版备份: {os.path.basename(backup)}）")
-        print(f"     请重新运行本脚本。")
-        sys.exit(0)
+        if restart:
+            # 标记本次已更新，防止重启后再次触发更新导致死循环
+            os.environ["HOLDLE_DATA_UPDATED"] = "1"
+            print("     自动重启，用新版代码继续本次任务...")
+            sys.stdout.flush()  # 防止输出重定向（块缓冲）时 execv 丢失更新过程日志
+            try:
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+            except Exception as e:
+                print(f"  ⚠️ 自动重启失败（{e}），请手动重新运行本脚本")
+                sys.exit(0)
+        else:
+            print(f"     请重新运行本脚本。")
+            sys.exit(0)
     except Exception as e:
         print(f"  ❌ 自动更新失败（{e}），请手动更新：git pull 或重新下载")
 
@@ -730,8 +767,9 @@ def main():
     print(f"输出目录: {out_dir}")
     print("=" * 70)
 
-    # 版本自检（非阻塞，每天最多一次；默认只提示，不自动覆盖）
-    _check_update(auto=False)
+    # 版本自检（v1.0.4 起：每次运行强制检查，非最新则先自动更新+重启，再继续拉数据；
+    # 安全校验（身份标记+备份）保留；失败静默继续不阻塞拉取）
+    _check_update(force=True, auto=True)
 
     name = code
     sym_tf = code_to_tickflow(code, market)
