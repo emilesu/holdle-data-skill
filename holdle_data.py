@@ -58,7 +58,7 @@ except ImportError:
     ak = None
 
 # ── 版本与更新（2026-08-19 新增自更新机制，2026-08-25 安全加固） ──────
-VERSION = "1.0.4"                      # skill 包版本（与 version.json 对齐）
+VERSION = "1.0.5"                      # skill 包版本（与 version.json 对齐）
 VERSION_URL_API = "https://api.github.com/repos/emilesu/holdle-data-skill/contents/version.json"
 VERSION_URL_RAW = "https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/version.json"
 # 国内镜像源（仅 jsDelivr CDN；ghproxy.net 第三方代理已移除，MITM 风险）
@@ -272,17 +272,27 @@ def parse_code(code):
 # ═══════════════════════════════════════════════════
 #  代码转换
 # ═══════════════════════════════════════════════════
+def _is_bj(code):
+    """北交所代码判断：43xxxx/83xxxx/87xxxx 及 920xxx 新段。沪市6/深市0、3除外。"""
+    return code.startswith(('4', '8', '92'))
+
+
 def code_to_baostock(code, market='a'):
-    """A股代码转 Baostock 格式"""
+    """A股代码转 Baostock 格式。北交所（4/8/92 开头）Baostock 不支持，返回 None。"""
     if market == 'a':
+        if _is_bj(code):
+            return None
         prefix = 'sh' if code.startswith('6') or code.startswith('9') else 'sz'
         return f"{prefix}.{code}"
     return None
 
 
 def code_to_tickflow(code, market='a'):
-    """A股/美股/港股代码转 TickFlow 格式（2026-08-19 实测：600519.SH / NVDA.US / 00700.HK）"""
+    """A股/美股/港股代码转 TickFlow 格式（2026-08-19 实测：600519.SH / NVDA.US / 00700.HK）
+    北交所（4/8/92 开头）TickFlow 不支持，返回 None 让主流程直接走新浪兜底。"""
     if market == 'a':
+        if _is_bj(code):
+            return None
         return f"{code}.SH" if code.startswith('6') else f"{code}.SZ"
     if market == 'us':
         return f"{code}.US"
@@ -428,6 +438,53 @@ def fetch_baostock_monthly(symbol_bs, adjustflag="1"):
 
 def fetch_baostock_weekly(symbol_bs, adjustflag="1"):
     return fetch_baostock_kline(symbol_bs, 'w', adjustflag)
+
+
+# ═══════════════════════════════════════════════════
+#  新浪 K线（兜底，支持沪深+北交所；日K重采样月/周）
+# ═══════════════════════════════════════════════════
+def _a_sina_prefix(code):
+    """A股/北交所新浪前缀：6→sh(沪)、北交所(4/8/92)→bj、其余→sz(深)"""
+    if code.startswith('6'):
+        return 'sh'
+    if _is_bj(code):
+        return 'bj'
+    return 'sz'
+
+
+def fetch_sina_kline(code, freq, adjust="backward"):
+    """新浪 A股/北交所 K线兜底（stock_zh_a_daily，日K；月/周从日K重采样）。
+    freq: 'D'/'W'/'M'；adjust: backward→hfq(后复权) forward→qfq(前复权)。
+    覆盖沪深市与北交所（TickFlow/Baostock 不支持北交所时用此兜底）。"""
+    if ak is None:
+        return pd.DataFrame()
+    try:
+        adj = 'hfq' if adjust == "backward" else 'qfq'
+        prefix = _a_sina_prefix(code)
+        df = ak.stock_zh_a_daily(symbol=f"{prefix}{code}", adjust=adj)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values('date').reset_index(drop=True)
+        if freq == 'D':
+            return df[['date', 'open', 'high', 'low', 'close', 'volume']]
+        # 月/周：日K重采样（W=周末、ME=月末；兼容 pandas 新旧 'W'/'ME' 写法）
+        s = df.set_index('date')
+        rule = 'ME' if freq == 'M' else 'W'
+        try:
+            res = s.resample(rule).agg(
+                {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).dropna()
+        except Exception:
+            res = s.resample('M' if freq == 'M' else 'W').agg(
+                {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).dropna()
+        res = res.reset_index().rename(columns={'index': 'date'})
+        # 剔除进行中的当月/当周 partial bar
+        res = res[['date', 'open', 'high', 'low', 'close', 'volume']]
+        res = _drop_partial_last(res, datetime.now(), 'M' if freq == 'M' else 'w')
+        return res
+    except Exception as e:
+        print(f"  ⚠️ 新浪K线({freq})异常: {e}")
+        return pd.DataFrame()
 
 
 # ═══════════════════════════════════════════════════
@@ -651,8 +708,53 @@ def fetch_financials_a_ths(code):
     return result
 
 
+def _a_em_prefix(code):
+    """东方财富代码前缀：6→SH(沪)、0/3→SZ(深)、北交所(4/8/92)→BJ"""
+    if code.startswith('6'):
+        return 'SH'
+    if _is_bj(code):
+        return 'BJ'
+    return 'SZ'
+
+
+def fetch_cash_ratio_a(code):
+    """A股/北交所「现金占总资产」= 货币资金/总资产（东方财富资产负债表，年报）。
+    返回 {年份: 百分比}。HOLDLE 企业质量门槛：≥10%合格，≥20%优秀。"""
+    if ak is None:
+        return {}
+    try:
+        import math
+        symbol = f"{_a_em_prefix(code)}{code}"
+        df = ak.stock_balance_sheet_by_report_em(symbol=symbol)
+        if df is None or df.empty:
+            return {}
+        if not ({"MONETARYFUNDS", "TOTAL_ASSETS"} <= set(df.columns)):
+            return {}
+        df = df.copy()
+        df['REPORT_DATE'] = df['REPORT_DATE'].astype(str)
+        df['年'] = df['REPORT_DATE'].str[:4]
+        # 只取年报（12-31），每年保留最新一条
+        df = df[df['REPORT_DATE'].str.contains('12-31', na=False)]
+        df = df.sort_values('REPORT_DATE').drop_duplicates(subset=['年'], keep='last')
+        result = {}
+        for _, row in df.iterrows():
+            money, total = row.get('MONETARYFUNDS'), row.get('TOTAL_ASSETS')
+            try:
+                money_f, total_f = float(money), float(total)
+            except Exception:
+                continue
+            if math.isnan(money_f) or math.isnan(total_f) or total_f == 0:
+                continue
+            result[row['年']] = round(money_f / total_f * 100, 2)
+        return result
+    except Exception as e:
+        print(f"  ⚠️ 现金占总资产获取失败: {e}")
+        return {}
+
+
 def fetch_financials_a(code):
-    """A股财务核心指标（新浪 stock_financial_abstract，近 FIN_YEARS 年；失败降级同花顺）"""
+    """A股财务核心指标（新浪 stock_financial_abstract，近 FIN_YEARS 年；失败降级同花顺）
+    额外从东方财富资产负债表补充「现金占总资产」（cash_ratio，货币资金/总资产）。"""
     if ak is None:
         print("  ⚠️ akshare 未安装（pip3 install akshare），跳过财报")
         return []
@@ -686,11 +788,22 @@ def fetch_financials_a(code):
                     val = val / 1e8
                 entry[key] = val
             result.append(entry)
+        # 补充现金占总资产（东方财富资产负债表，货币资金/总资产）
+        try:
+            cr = fetch_cash_ratio_a(code)
+            for e in result:
+                e['cash_ratio'] = cr.get(e['年份'], float('nan'))
+        except Exception:
+            pass
         return result
     except Exception as e:
         print(f"  ⚠️ 新浪财报获取失败，降级同花顺: {e}")
         try:
-            return fetch_financials_a_ths(code)
+            fin_ths = fetch_financials_a_ths(code)
+            cr = fetch_cash_ratio_a(code)
+            for e in fin_ths:
+                e['cash_ratio'] = cr.get(e['年份'], float('nan'))
+            return fin_ths
         except Exception:
             return []
 
@@ -763,7 +876,7 @@ def main():
     print(f"HOLDLE 行情数据获取（用户版 v0.4）")
     print(f"标的: {code}（{market_label}）  |  {now.strftime('%Y-%m-%d %H:%M')}")
     print(f"复权口径: {adj_label}（{adjust}）")
-    print(f"数据源: TickFlow 主用（月/周/日）→ Baostock 降级 · AkShare 财报 · 腾讯/新浪 实时")
+    print(f"数据源: TickFlow 主用（月/周/日）→ Baostock 降级 → 新浪兜底（支持北交所）· AkShare 财报/资产负债表 · 腾讯/新浪 实时")
     print(f"输出目录: {out_dir}")
     print("=" * 70)
 
@@ -805,12 +918,12 @@ def main():
         fin = fetch_financials_us(code)
     if fin:
         fdf = pd.DataFrame(fin)
-        want = ['年份', 'roe', 'roa', 'gross_margin', 'net_margin', 'net_profit', 'cash_flow', 'debt_ratio']
+        want = ['年份', 'roe', 'roa', 'gross_margin', 'net_margin', 'net_profit', 'cash_flow', 'cash_ratio', 'debt_ratio']
         showf = fdf[[c for c in want if c in fdf.columns]].copy()
         showf = showf.rename(columns={
             'roe': 'ROE(%)', 'roa': 'ROA(%)', 'gross_margin': '毛利率(%)',
             'net_margin': '净利率(%)', 'net_profit': '净利润(亿)', 'cash_flow': '经营现金流(亿)',
-            'debt_ratio': '负债率(%)'
+            'cash_ratio': '现金占总资产(%)', 'debt_ratio': '负债率(%)'
         })
         showf.to_csv(f"{out_dir}/{code}_财务_近20年.csv", index=False)
         print(f"  ✅ 已存 {code}_财务_近20年.csv")
@@ -818,7 +931,7 @@ def main():
     else:
         print("  ❌ 财报获取失败")
 
-    # ── 2. 月K线（TickFlow 主用 → Baostock 降级） ─
+    # ── 2. 月K线（TickFlow 主用 → Baostock 降级 → 新浪兜底） ─
     print(f"\n[2/5] 月K线（{adj_label}）+ MACD...")
     monthly = fetch_tickflow_monthly(sym_tf, adjust=adj_tf)
     monthly_src = 'TickFlow'
@@ -826,6 +939,10 @@ def main():
         print("  ⚠️ TickFlow 月K不可用，降级到 Baostock...")
         monthly = fetch_baostock_monthly(bs_code)
         monthly_src = 'Baostock(降级)'
+    if monthly.empty and market == 'a':
+        print("  ⚠️ TickFlow/Baostock 月K不可用，降级到 新浪（支持北交所）...")
+        monthly = fetch_sina_kline(code, 'M', adjust)
+        monthly_src = '新浪(降级)'
     if not monthly.empty:
         dif, dea, mbar = calc_macd(monthly)
         monthly['DIF'] = dif.round(2)
@@ -841,12 +958,15 @@ def main():
     else:
         print("  ❌ 月K获取失败")
 
-    # ── 3. 周K线（TickFlow 主用 → Baostock 降级） ─
+    # ── 3. 周K线（TickFlow 主用 → Baostock 降级 → 新浪兜底） ─
     print(f"\n[3/5] 周K线（{adj_label}）+ MACD...")
     weekly = fetch_tickflow_weekly(sym_tf, adjust=adj_tf)
     if weekly.empty and bs_code:
         print("  ⚠️ TickFlow 周K不可用，降级到 Baostock...")
         weekly = fetch_baostock_weekly(bs_code, adjustflag=adj_bs)
+    if weekly.empty and market == 'a':
+        print("  ⚠️ TickFlow/Baostock 周K不可用，降级到 新浪（支持北交所）...")
+        weekly = fetch_sina_kline(code, 'W', adjust)
     if not weekly.empty:
         dif, dea, mbar = calc_macd(weekly)
         weekly['DIF'] = dif.round(2)
@@ -858,9 +978,12 @@ def main():
     else:
         print("  ⚠️ 周K获取失败")
 
-    # ── 4. 日K线（TickFlow） ────────────────────
+    # ── 4. 日K线（TickFlow → 新浪兜底） ──────────
     print(f"\n[4/5] 日K线（TickFlow Free，{adj_label}）+ MACD...")
     daily = fetch_tickflow_daily(sym_tf, adjust=adj_tf)
+    if daily.empty and market == 'a':
+        print("  ⚠️ TickFlow 日K不可用，降级到 新浪（支持北交所）...")
+        daily = fetch_sina_kline(code, 'D', adjust)
     if not daily.empty:
         dif, dea, mbar = calc_macd(daily)
         daily['DIF'] = dif.round(2)

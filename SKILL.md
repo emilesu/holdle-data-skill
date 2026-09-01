@@ -100,8 +100,8 @@ monthly = pd.read_csv(f"{OUT}/{code}_月K_{adjust_label}.csv")
 
 | 数据 | 来源 | 说明 |
 |:--|:--|:--|
-| 月K/周K/日K | TickFlow（免费）→ Baostock 降级 | 后复权/前复权均支持 |
-| 财报 | AkShare（东方财富） | **A股/港股/美股** 近20年 |
+| 月K/周K/日K | TickFlow（免费）→ Baostock 降级 → 新浪兜底 | 后复权/前复权均支持；**支持北交所**（43/83/87/92 开头，新浪 stock_zh_a_daily） |
+| 财报 | AkShare（新浪/同花顺 + 东财资产负债表） | **A股/港股/美股** 近20年；A股含「现金占总资产」字段（货币资金/总资产） |
 | 实时行情 | 腾讯（A/港）/ 新浪（美股） | |
 
 依赖：先检查 `python3 -c "import baostock, tickflow, akshare, pandas"`，缺哪个装哪个（`pip3 install <缺的包>`）
