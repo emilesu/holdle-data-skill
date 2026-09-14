@@ -937,7 +937,7 @@ def main():
     monthly_src = 'TickFlow'
     if monthly.empty and bs_code:
         print("  ⚠️ TickFlow 月K不可用，降级到 Baostock...")
-        monthly = fetch_baostock_monthly(bs_code)
+        monthly = fetch_baostock_monthly(bs_code, adjustflag=adj_bs)  # 2026-09-14 修：原漏传 → 降级时口径退回后复权
         monthly_src = 'Baostock(降级)'
     if monthly.empty and market == 'a':
         print("  ⚠️ TickFlow/Baostock 月K不可用，降级到 新浪（支持北交所）...")
