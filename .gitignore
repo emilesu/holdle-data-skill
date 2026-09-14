@@ -4,3 +4,6 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# 运行时输出数据（行情/财务 CSV，可重新生成，不入库）
+holdle_data/
