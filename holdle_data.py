@@ -58,7 +58,7 @@ except ImportError:
     ak = None
 
 # ── 版本与更新（2026-08-19 新增自更新机制，2026-08-25 安全加固） ──────
-VERSION = "1.0.6"                      # skill 包版本（与 version.json 对齐）
+VERSION = "1.0.7"                      # skill 包版本（与 version.json 对齐）
 VERSION_URL_API = "https://api.github.com/repos/emilesu/holdle-data-skill/contents/version.json"
 VERSION_URL_RAW = "https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/version.json"
 # 国内镜像源（仅 jsDelivr CDN；ghproxy.net 第三方代理已移除，MITM 风险）
@@ -551,12 +551,40 @@ def fetch_sina_us_realtime(symbol):
 EM_INDICATORS = {
     'roe': ['净资产收益率(ROE)', '净资产收益率'],
     'gross_margin': ['毛利率'],
+    # ⚠️ net_margin = 东财「销售净利率」= 含少数股东损益口径（2026-09-27 实测核实：
+    #    重庆啤酒 2025 该值为 16.83%，而归母口径仅 8.36%）。
+    #    HOLDLE 净利率门槛要求归母口径 → 用下方 revenue + parent_net_profit 自算 parent_net_margin。
     'net_margin': ['销售净利率'],
     'debt_ratio': ['资产负债率'],
     'cash_flow': ['经营现金流量净额', '经营活动产生的现金流量净额'],
     'net_profit': ['净利润', '归母净利润'],
     'roa': ['总资产报酬率(ROA)', '总资产报酬率'],
+    # ── 2026-09-27 新增（创始人拍板「方案A」）：支撑归母净利率门槛口径 ──
+    'revenue': ['营业总收入', '营业收入'],                    # 单位：元（后续统一 /1e8 转亿）
+    'parent_net_profit': ['归母净利润', '归属于母公司所有者的净利润'],
 }
+
+
+def _parent_net_margin(parent_net_profit_yi, revenue_yi):
+    """归母净利率（%）= 归母净利润 ÷ 营业总收入，两值均为「亿元」。
+
+    为什么要自算而不直接用数据源自带的「销售净利率 / 净利率」：
+      各源口径不一致——东财「销售净利率」与同花顺「销售净利率」是**含少数股东损益**口径；
+      港股/美股接口的 NET_PROFIT_RATIO 亦无法与其 HOLDER_PROFIT / OPERATE_INCOME 绝对额对齐。
+    统一用两个绝对额相除，才能保证跨市场口径一致、可核验。
+    任一值为 nan、或营收为 0 → 返回 nan（不猜）。
+    """
+    import math
+    def bad(v):
+        return v is None or (isinstance(v, float) and math.isnan(v))
+    if bad(parent_net_profit_yi) or bad(revenue_yi):
+        return float('nan')
+    try:
+        if not float(revenue_yi):
+            return float('nan')
+        return float(parent_net_profit_yi) / float(revenue_yi) * 100.0
+    except Exception:
+        return float('nan')
 
 def fetch_financials_hk(code):
     """港股财务核心指标（东方财富 stock_financial_hk_analysis_indicator_em），近 FIN_YEARS 年"""
@@ -586,9 +614,14 @@ def fetch_financials_hk(code):
                 'gross_margin': num('GROSS_PROFIT_RATIO'),
                 'net_margin': num('NET_PROFIT_RATIO'),
                 'debt_ratio': num('DEBT_ASSET_RATIO'),
+                # 港股：HOLDER_PROFIT = 股东应占溢利 = 归母净利润（2026-09-27 核实）
                 'net_profit': num('HOLDER_PROFIT') / 1e8 if row.get('HOLDER_PROFIT') else float('nan'),
                 'cash_flow': num('PER_NETCASH_OPERATE'),  # 每股经营现金流
+                # ── 2026-09-27 新增：归母净利率门槛口径（OPERATE_INCOME=营业总收入）──
+                'revenue': num('OPERATE_INCOME') / 1e8 if row.get('OPERATE_INCOME') else float('nan'),
+                'parent_net_profit': num('HOLDER_PROFIT') / 1e8 if row.get('HOLDER_PROFIT') else float('nan'),
             }
+            entry['parent_net_margin'] = _parent_net_margin(entry.get('parent_net_profit'), entry.get('revenue'))
             result.append(entry)
         return result
     except Exception as e:
@@ -641,7 +674,11 @@ def fetch_financials_us(code):
                 'net_profit': num('PARENT_HOLDER_NETPROFIT') / 1e8 if row.get('PARENT_HOLDER_NETPROFIT') else float('nan'),
                 # 经营现金流：美股现金流量表「经营活动产生的现金流量净额」（元→亿）
                 'cash_flow': ocf_by_year[year] / 1e8 if year in ocf_by_year else float('nan'),
+                # ── 2026-09-27 新增：归母净利率门槛口径（PARENT_HOLDER_NETPROFIT=归母净利润）──
+                'revenue': num('OPERATE_INCOME') / 1e8 if row.get('OPERATE_INCOME') else float('nan'),
+                'parent_net_profit': num('PARENT_HOLDER_NETPROFIT') / 1e8 if row.get('PARENT_HOLDER_NETPROFIT') else float('nan'),
             }
+            entry['parent_net_margin'] = _parent_net_margin(entry.get('parent_net_profit'), entry.get('revenue'))
             result.append(entry)
         return result
     except Exception as e:
@@ -697,13 +734,20 @@ def fetch_financials_a_ths(code):
             '年份': year,
             'roe': _parse_ths_num(row.get('净资产收益率')),
             'gross_margin': _parse_ths_num(row.get('销售毛利率')),
+            # ⚠️ 同花顺「销售净利率」为**含少数股东损益**口径（2026-09-27 实测 600132 2025H1：
+            #    该列 19.55%，归母口径实为 9.79%）；而「净利润」列是**归母**净利润（8.65 亿）。
+            #    同源两列口径不一致 → 归母净利率一律自算，不得用该列。
             'net_margin': _parse_ths_num(row.get('销售净利率')),
             'debt_ratio': _parse_ths_num(row.get('资产负债率')),
             # 同花顺关键指标无经营现金流总额，用每股经营现金流（元/股）兜底，语义与港股/美股分支一致
             'cash_flow': _parse_ths_num(row.get('每股经营现金流')),
-            'net_profit': _parse_ths_num(row.get('净利润')) / 1e8,  # 元 → 亿
+            'net_profit': _parse_ths_num(row.get('净利润')) / 1e8,  # 元 → 亿（同花顺该列为归母）
             'roa': float('nan'),  # 同花顺关键指标无 ROA，留空（主接口正常时不受影响）
+            # ── 2026-09-27 新增：归母净利率门槛口径 ──
+            'revenue': _parse_ths_num(row.get('营业总收入')) / 1e8,        # 元 → 亿
+            'parent_net_profit': _parse_ths_num(row.get('净利润')) / 1e8,  # 元 → 亿（归母）
         }
+        entry['parent_net_margin'] = _parent_net_margin(entry.get('parent_net_profit'), entry.get('revenue'))
         result.append(entry)
     return result
 
@@ -784,9 +828,11 @@ def fetch_financials_a(code):
                         val = float(val)
                     except Exception:
                         val = float('nan')
-                if key in ('net_profit', 'cash_flow') and isinstance(val, (int, float)) and not (isinstance(val, float) and math.isnan(val)):
+                if key in ('net_profit', 'cash_flow', 'revenue', 'parent_net_profit') and isinstance(val, (int, float)) and not (isinstance(val, float) and math.isnan(val)):
                     val = val / 1e8
                 entry[key] = val
+            # 归母净利率（%）：两个绝对额自算（HOLDLE 门槛口径，见 _parent_net_margin 说明）
+            entry['parent_net_margin'] = _parent_net_margin(entry.get('parent_net_profit'), entry.get('revenue'))
             result.append(entry)
         # 补充现金占总资产（东方财富资产负债表，货币资金/总资产）
         try:
@@ -918,11 +964,17 @@ def main():
         fin = fetch_financials_us(code)
     if fin:
         fdf = pd.DataFrame(fin)
-        want = ['年份', 'roe', 'roa', 'gross_margin', 'net_margin', 'net_profit', 'cash_flow', 'cash_ratio', 'debt_ratio']
+        want = ['年份', 'roe', 'roa', 'gross_margin', 'parent_net_margin', 'net_margin',
+                'parent_net_profit', 'net_profit', 'revenue', 'cash_flow', 'cash_ratio', 'debt_ratio']
         showf = fdf[[c for c in want if c in fdf.columns]].copy()
         showf = showf.rename(columns={
             'roe': 'ROE(%)', 'roa': 'ROA(%)', 'gross_margin': '毛利率(%)',
-            'net_margin': '净利率(%)', 'net_profit': '净利润(亿)', 'cash_flow': '经营现金流(亿)',
+            # ⭐ 归母净利率 = HOLDLE 净利率门槛口径；「净利率(含少数)」仅作对照，不得用于门槛判定
+            'parent_net_margin': '归母净利率(%)⭐',
+            'net_margin': '净利率(含少数)(%)',
+            'parent_net_profit': '归母净利润(亿)', 'net_profit': '净利润(含少数)(亿)',
+            'revenue': '营业总收入(亿)',
+            'cash_flow': '经营现金流(亿)',
             'cash_ratio': '现金占总资产(%)', 'debt_ratio': '负债率(%)'
         })
         showf.to_csv(f"{out_dir}/{code}_财务_近20年.csv", index=False)
