@@ -41,7 +41,7 @@ python3 holdle_data.py 600519 ./data --adjust forward   # 前复权（当前判�
 python3 holdle_data.py NVDA ./data --adjust backward    # 后复权（历史复盘）
 ```
 
-输出：月K/周K/日K CSV（含 MACD 指标）+ 财务（A股）+ 实时行情。
+输出：月K/周K/日K CSV（含 MACD 指标）+ 财务（A股/港股/美股，含**归母净利率**列）+ 实时行情。
 
 ## 免责声明
 
