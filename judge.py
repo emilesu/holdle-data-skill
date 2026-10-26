@@ -35,12 +35,19 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
 
 SCHEMA_VERSION = "0.4"
+# 月末交易日历（随包分发；缺失时保守判「未收完」，绝不工作日推断）
+_CAL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trading_calendar_months.json")
+_MONTH_CAL = None
+# SA-06 金融标的名单（随包分发，10KB）
+_FIN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "finance_symbols.json")
+_FIN_SET = None
 CALIBER_VERSION = "v1.10.1"      # 01_口径映射表 v1.10.1
 
 # ── 判定常量（出处：03_投资体系/02_状态A判断体系 v2.18 + 映射表 v1.10.1）──
@@ -58,6 +65,15 @@ FINANCE_KEYWORDS = (
     "资本市场", "资产管理", "金融数据与交易所", "金融综合集团", "信用服务",
     "抵押金融", "抵押REIT", "专业保险", "保险经纪", "再保险", "地区银行",
     "多元化银行", "寿险", "综合保险", "财险",
+)
+
+# 🔴 2026-10-26 审查 H4 修复：用户端链路原先**一处免责段都没有**（judge.py / holdle_data.py 皆 0 处）。
+#    这是品牌红线（不荐股/不预测/不承诺收益），必须由脚本写死在输出里，模型改不掉。
+DISCLAIMER = (
+    "\n\n———\n"
+    "以上为按 HOLDLE 方法论得出的客观判定结果，不构成任何投资建议或买卖推荐。"
+    "方法论不预测涨跌、不承诺收益；过去的判定结果不代表未来表现。"
+    "投资有风险，决策请自行判断并独立承担后果。"
 )
 
 HUMAN_JUDGEMENT_NOTES = [
@@ -496,36 +512,139 @@ def _build_entry(events: list, daily: pd.DataFrame, monthly_all: pd.DataFrame,
 
 
 
-def _month_closed(monthly):
+def _load_month_calendar():
+    """加载月末交易日历（随包分发的 trading_calendar_months.json，约 34KB）。
+
+    🔴 为什么必须有它（2026-10-26 审查 C1 打回的直接原因）：
+       原实现用 pd.bdate_range 推「该月最后一个工作日」，这在 A 股**必然判错**——
+       春节/国庆所在月的真实末交易日远早于工作日推断值。知识库注释记载实测
+       125 个月里 8 个月判反（2020-01、2022-01、2025-01、2023-09、2018-04/12…）。
+       判反的后果不是"保守"，而是把用户刚出现的开窗判成"机会已过去"。
+
+    返回 {market: {ym: last_trading_day_or_None}}；文件缺失时返回 None（调用方须保守处理）。
+    """
+    global _MONTH_CAL
+    if _MONTH_CAL is not None:
+        return _MONTH_CAL
+    path = _CAL_PATH
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        _MONTH_CAL = raw.get("months") or {}
+    except Exception:
+        _MONTH_CAL = {}          # 缺失/损坏 → 空表，调用方据此保守判「未收完」
+    return _MONTH_CAL
+
+
+def _is_finance_symbol(code, market="a"):
+    """该标的是否属于 SA-06 金融类（默认不参与状态A判定）。
+
+    🔴 2026-10-26 审查 C2 修复（P0 级）：
+       原实现只在调用方传了 industry 时才拒判，而 holdle_data.py 从来没传过 →
+       中国平安（保险）被判成普通股票、给出开窗与参考价，与知识库记录的 P0 事故同型。
+       现改为**按代码自动查内置名单**，不依赖调用方传参，杜绝"忘了传就静默放行"。
+
+    名单覆盖三市场全部金融标的（122/228/815 个）。查不到 = 非金融。
+    名单文件缺失时返回 False 并**不拒判**（宁可判，也不能因缺文件把所有股票判成不可判）。
+    """
+    global _FIN_SET
+    if _FIN_SET is None:
+        try:
+            with open(_FIN_PATH, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            _FIN_SET = {mk: {str(x).upper() for x in (v or [])}
+                        for mk, v in (raw.get("symbols") or {}).items()}
+        except Exception:
+            _FIN_SET = {}
+    mk = "us" if market == "us" else ("hk" if market == "hk" else "a")
+    codes = _FIN_SET.get(mk) or set()
+    c = str(code).strip().upper()
+    cands = {c}
+    # A股：名单存 SH600000 形态，调用方可能只给 600000
+    if mk == "a":
+        n = c.split(".")[0]
+        cands |= {n, "SH" + n, "SZ" + n, "BJ" + n}
+    # 港股：名单存 00005.HK，调用方可能给 700 / 00700 / 00700.HK
+    if mk == "hk":
+        n = c.split(".")[0].lstrip("0") or "0"
+        cands |= {n, n.zfill(4) + ".HK", n.zfill(5) + ".HK", n.zfill(4), n.zfill(5)}
+    return bool(cands & codes)
+
+
+def _compute_stale(trade_date):
+    """数据是否陈旧（超过 2 个交易日未更新）→ 映射表 R-STALE-DATA。
+
+    🔴 2026-10-26 审查 H1 修复：原为字面量 False 硬编码，导致陈旧话术**永远发不出来**，
+       停更股会被当成新鲜数据判定且零提示。
+    交易日按工作日估算（未剔节假日，偏保守 → 更容易标陈旧，方向安全）。
+    回放场景（as_of）不适用：那时"陈旧"另有 replay_stale 表达。
+    """
+    try:
+        td = pd.Timestamp(trade_date).normalize()
+        now = pd.Timestamp.now().normalize()
+        if td >= now:
+            return False
+        tdays = max(int(pd.bdate_range(td, now).size) - 1, 0)
+        return bool(tdays > 2)
+    except Exception:
+        return False
+
+
+def _month_closed(monthly, market="a"):
     """本月是否已收完 → (是否收完, 最后已收完月份)。
 
-    K4 / 映射表 D-02：只有整月走完才判该月状态A。
+    K4 / 映射表 D-02 防未来函数：只有整月走完才判该月状态A。
+    月中快照绝不能当整月判——否则 MACD 用的是半根柱子。
 
-    判据（与知识库 trading_calendar 同一思路）：月线由日线重采样而来，最后一个自然月的
-    「月末收盘价」取自数据截止日。**若数据截止日之后该自然月还有交易日，则该月未收完**。
-    简化实现（data-skill 只有日线，没有交易所日历）：
-      · 若月度序列最后两行不相邻（中间有空月）→ 最后一行就是数据跨到的月，可能未收完
-      · 保守判据：只有当数据截止日 == 该自然月的最后一个工作日时才算收完
-        （工作日推断在节假日月会偏保守 → 宁可说「未收完」，不会把月中当整月）
+    🔴 判据（2026-10-26 审查 C1/H5 修复，替换原工作日推断）：
+       1. 查月末日历，得到「该自然月最后一个真实交易日」= last_td
+       2. 日历里该月为 null（月末数据不完整）→ **未收完**
+       3. 日历里查不到该月（超出覆盖范围/文件缺失）→ **未收完**（保守，绝不猜）
+       4. 数据末日 >= last_td → 已收完；否则未收完
+
+    注意：不再做任何"工作日推断"，也不再比较机器时钟——回放与实时是同一套判据。
     """
     if len(monthly) < 2:
         return False, None
     last = monthly.iloc[-1]
     last_ym = str(last["ym"])
     last_end = pd.Timestamp(last["month_end"]).normalize()
-    period = pd.Period(last_ym, "M")
-    # 该自然月最后一个工作日
-    bd = pd.bdate_range(period.start_time, period.end_time)
-    month_last_bd = bd[-1].normalize() if len(bd) else last_end
-    # 数据已跨入次月（月序列比数据多出一个月）→ 说明该月已走完
-    if last_end < month_last_bd and (pd.Timestamp(monthly.iloc[-1]["month_end"]).normalize()
-                                     < pd.Timestamp.now().normalize() - pd.Timedelta(days=3)
-                                     ):
+    prev_ym = str(monthly.iloc[-2]["ym"]) if len(monthly) >= 2 else None
+
+    cal = _load_month_calendar() or {}
+    mk = "us" if market == "us" else ("hk" if market == "hk" else "cn")
+    month_map = cal.get(mk) or {}
+    last_td = month_map.get(last_ym)
+
+    # 🔴 区分三种"不知道"（2026-10-26 审查 C-3）：
+    #    ① 该月是数据源停更月 / 月末不完整 → 判「未收完」（正常，下个月就有数据了）
+    #    ② 日历里根本没有这个月（超出覆盖范围）→ **判定能力失效**，必须明确报出来，
+    #       不能伪装成「本月未收完」——否则 2026-11 起所有用户所有股票都会永久显示
+    #       "本月尚未收完"，用户以为只是没到月末，实际是日历过期了。
+    if last_td is None:
+        covered_max = max(month_map.keys()) if month_map else None
+        truncated_month = (last_ym == covered_max)      # 数据源停更的那一个月
+        if not truncated_month:
+            # 🔴 日历没覆盖该月 → 先用**该股自身数据**自证（不依赖日历，也不会用到未来数据）：
+            #    若数据已跨入次月（月序列里后面还有月），该月必然已走完。
+            try:
+                if (pd.Period(last_ym, "M") - pd.Period(prev_ym, "M")).n > 1:
+                    return True, prev_ym
+            except Exception:
+                pass
+            # 再看：该月是否已经过去很久（数据里该月之后没有月线，但今天已远超该月）
+            # —— 这种情况仍不可判（可能停牌/退市），交给调用方报 calendar_unavailable
+            return None, prev_ym        # None = 无法确定，调用方须报「判定能力不可用」
+        try:
+            if (pd.Period(last_ym, "M") - pd.Period(prev_ym, "M")).n > 1:
+                return True, prev_ym
+        except Exception:
+            pass
+        return False, prev_ym
+
+    if last_end >= pd.Timestamp(last_td).normalize():
         return True, last_ym
-    # 数据截止已越过该月月末（回放/历史数据）→ 收完
-    if last_end >= month_last_bd:
-        return True, last_ym
-    return False, (str(monthly.iloc[-2]["ym"]) if len(monthly) >= 2 else None)
+    return False, prev_ym
 
 
 def _state_a_sentence(state_a_status, month):
@@ -583,6 +702,8 @@ def _finalize(out):
     rs["forbidden_additions"] = ["任何过渡句、建议句、鼓励句"]
     rs["fallback_unknown"] = ("这个问题超出了当前判定能给出的范围，我不做推测。"
                               "你可以问我这只股票的状态A、开窗事件、入场参考价或出场参考。")
+    # H4：免责段恒在末尾，不经模型、不可省略
+    out["disclaimer"] = DISCLAIMER
     return out
 
 
@@ -618,7 +739,26 @@ def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None):
                 "行情数据缺少必要列 %s，无法判定。" % c)]
             return _finalize(out)
 
+    # ---- 输入契约防呆（对抗性审查建议，2026-10-26）----
+    # 🔴 judge.py 的输入契约是「open/high/low/close 已是前复权价」。
+    #    这条链路上没有类型系统保护：若上游任何一段退回未复权价，判定会**静默用错数据**，
+    #    算出的状态A/参考价全错而不会报错（知识库层面曾出现过"喂了未复权列"的事故）。
+    #    这里加一道廉价体检：价格必须为正且有限，且不存在复用原始价导致的价格跳变（>10 倍）。
+    _px = daily[["open", "high", "low", "close"]].astype(float)
+    if (_px <= 0).any().any() or _px.isna().all(axis=None):
+        out["status"] = "indeterminate"; out["indeterminate_reason"] = "data_quality"
+        out["required_statement"]["units"] = [_unit(20, "R-DATA-QUALITY",
+            "行情数据存在非正或全空的价格，无法判定。请重新拉取数据后重试。")]
+        return _finalize(out)
+    _ratio = (_px.max() / _px.min()).max()
+    if _ratio > 1e4:
+        out["status"] = "indeterminate"; out["indeterminate_reason"] = "data_quality"
+        out["required_statement"]["units"] = [_unit(20, "R-DATA-QUALITY",
+            "行情数据的价格跨度异常（疑似复权口径不一致），无法判定。请重新拉取数据后重试。")]
+        return _finalize(out)
+
     # ---- as_of 截断（必须早于任何指标计算）----
+    as_of_beyond_data = False
     if as_of:
         try:
             a = pd.Timestamp(as_of).normalize()
@@ -632,11 +772,27 @@ def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None):
             out["required_statement"]["units"] = [_unit(20, "R-INSUFFICIENT",
                 "所问的 %s 早于该股数据起点，该日期没有可用的行情数据，因此无法回放判定。" % as_of)]
             return _finalize(out)
+        _data_end_before = pd.Timestamp(daily["date"].max()).normalize()
+        as_of_beyond_data = a > _data_end_before
         daily = daily[daily["date"] <= a].copy()
 
     trade_date = pd.Timestamp(daily["date"].max()).normalize()
     monthly = judge_state_a(_resample_monthly(daily))
-    month_closed, last_closed = _month_closed(monthly)
+    month_closed, last_closed = _month_closed(monthly, market=market)
+    if month_closed is None:
+        # 日历没覆盖到该月 → 判定能力不可用，必须明说，不得伪装成「本月未收完」
+        out["status"] = "indeterminate"
+        out["indeterminate_reason"] = "calendar_unavailable"
+        out["data_snapshot"] = {
+            "trade_date": pd.Timestamp(daily["date"].max()).normalize().strftime("%Y-%m-%d"),
+            "as_of": as_of, "adjust": "forward", "source": "holdle-data-skill",
+            "is_stale": False, "calendar_covered_through": None,
+        }
+        out["required_statement"]["units"].append(_unit(20, "R-CALENDAR-STALE",
+            "本地的交易日历没有覆盖到该股最新的月份，无法判断这个月是否已经收完，"
+            "因此本次不做判定。请更新数据脚本（运行 --auto-update）后重试；"
+            "在拿到判定之前，请不要用其它方式推断结论。"))
+        return _finalize(out)
 
     lag = int((pd.Timestamp.now().normalize() - pd.Timestamp(as_of).normalize()).days) if as_of else 0
     out["data_snapshot"] = {
@@ -645,20 +801,39 @@ def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None):
         "data_end": trade_date.strftime("%Y-%m-%d"),
         "as_of": as_of, "requested_as_of": as_of, "adjust": "forward",
         "source": "holdle-data-skill", "last_month_closed": last_closed,
-        "is_stale": False,
+        "is_stale": _compute_stale(trade_date),
         "replay_stale": bool(as_of and lag > 0),
         "replay_lag_days": lag,
     }
+    if as_of and as_of_beyond_data:
+        _de = trade_date.strftime("%Y-%m-%d")
+        out["required_statement"]["units"].append(_unit(2, "R-ASOF-BEYOND",
+            "注意：行情数据只到 %s，所问的 %s 还没有数据；以下判定只能基于 %s 为止的数据，"
+            "不代表 %s 的状态。" % (_de, as_of, _de, as_of)))
     if as_of and lag > 0:
         out["required_statement"]["units"].append(_unit(3, "R-ASOF-REPLAY",
             "（历史回放）以下判定基于截至 %s 的行情数据，距当前已 %d 天；"
             "描述的是那一天的状态，不代表此后发生的情况。" % (as_of, lag)))
+    # 🔴 2026-10-26 审查修复：is_stale 原来只算不发（映射表 R-STALE-DATA 没落地），
+    #    停更股会被当新鲜数据判定且零提示。这里补上话术，且必须排在判定语句之前。
+    if out["data_snapshot"].get("is_stale") and not as_of:
+        try:
+            _td = pd.Timestamp(trade_date)
+            _days = int((pd.Timestamp.now().normalize() - _td).days)
+        except Exception:
+            _days = 0
+        out["required_statement"]["units"].append(_unit(5, "R-STALE-DATA",
+            "注意：数据截至 %s，距今天已 %d 天，行情可能已变化。" % (trade_date.strftime("%Y-%m-%d"), _days)))
 
     # ---- SA-06 金融 / SA-04 次新 ----
+    _fin_hit = _is_finance_symbol(code, market)
     if industry and any(k in str(industry) for k in FINANCE_KEYWORDS):
+        _fin_hit = True
+    if _fin_hit:
         out["status"] = "indeterminate"; out["indeterminate_reason"] = "finance_industry"
+        _ind_txt = ("该股属于%s。" % industry) if industry else "该股属于金融行业。"
         out["required_statement"]["units"].append(_unit(20, "R-NOT-PARTICIPATING",
-            "该股属于%s。按 HOLDLE 方法论，金融类默认不参与状态A判定，本工具不做判定。" % industry))
+            _ind_txt + "按 HOLDLE 方法论，金融类默认不参与状态A判定，本工具不做判定。"))
         return _finalize(out)
     listed = (monthly["ym"].iloc[-1] - monthly["ym"].iloc[0]).n
     if listed < NEW_MONTHS:
@@ -714,14 +889,16 @@ def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None):
     if out["state_a"]["status"] != "true" and en is not None:
         out["entry"] = None; out["exit"] = None; en = None
         out["required_statement"]["units"].append(_unit(48, "R-REF-VOID",
-            "由于当前不处于状态A，此前的入场参考价已作废，等待作废后需重新观察。"))
+            ("由于当时不处于状态A" if as_of else "由于当前不处于状态A")
+            + "，此前的入场参考价已作废，等待作废后需重新观察。"))
 
     alive = (out.get("window") or {}).get("alive") or {}
     if en is not None and not alive.get("is_alive"):
         out["entry"] = None; out["exit"] = None; en = None
         out["required_statement"]["units"].append(_unit(46, "R-WINDOW-EXPIRED",
             "本轮入场机会已经过去（历史上是否突破已不重要）；"
-            "当前不提供入场参考价，需等待下一次开窗。"))
+            + ("当时不提供入场参考价" if as_of else "当前不提供入场参考价")
+            + "，需等待下一次开窗。"))
 
     if en:
         if en.get("ref_price"):
@@ -736,8 +913,19 @@ def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None):
             out["required_statement"]["units"].append(_unit(45, "R-MISS5",
                 "%s 开盘价已超过入场参考价约 5%%，属不追范围，本次放弃等待下一次。" % br.get("date")))
         elif st == "expired":
-            out["required_statement"]["units"].append(_unit(45, "R-BREAKOUT-NO",
-                "入场有效期已过（截至 %s），期间日K未突破入场参考价。" % en.get("entry_deadline")))
+            # 🔴 2026-10-26 审查 H5/P0 修复：原来不看 expire_reason，一律说「有效期已过」，
+            #    导致「该窗口仍存活…入场有效期已过」同屏自相矛盾（模型只能转述，念的就是错的那句）。
+            #    正确语义（方法论）：入场有效期 = 窗口存活期，没有"到某日作废"这回事；
+            #    只有窗口真关闭，或数据到头了，才是两种不同的说法。
+            _why = en.get("expire_reason")
+            if _why == "window_closed":
+                out["required_statement"]["units"].append(_unit(45, "R-BREAKOUT-NO",
+                    "入场有效期已过（截至 %s），期间日K未突破入场参考价。" % en.get("entry_deadline")))
+            else:
+                # data_end：只是数据到头，窗口还活着，入场等待继续有效
+                out["required_statement"]["units"].append(_unit(45, "R-BREAKOUT-NO",
+                    "截至数据末端 %s，日K尚未突破入场参考价；窗口仍存活，入场等待继续有效。"
+                    % out["data_snapshot"]["trade_date"]))
         elif st == "entered":
             out["required_statement"]["units"].append(_unit(45, "R-BREAKOUT-YES",
                 "%s 已突破入场参考价。" % br.get("date")))

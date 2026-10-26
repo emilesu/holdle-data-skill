@@ -59,13 +59,21 @@ except ImportError:
     ak = None
 
 # ── 版本与更新（2026-08-19 新增自更新机制，2026-08-25 安全加固） ──────
-VERSION = "1.0.8"                      # skill 包版本（与 version.json 对齐）
+VERSION = "1.0.9"                      # skill 包版本（与 version.json 对齐）
 
 # 🔴 v1.0.8（2026-10-26）：自更新从「只更新自己」扩展为「更新自己 + 附属模块」。
 #   背景：judge.py（判定模块）是 v1.0.8 新增的附属文件，只更新 holdle_data.py 会导致
 #   老用户升级后 holdle_data.py 里 import judge 找不到文件 → 判定静默失效。
 #   原则：附属模块缺失只降级（告警 + 不判定），绝不让整个数据拉取失败。
-SIDE_MODULES = ["judge.py"]           # 与主脚本同目录、需随版本一起分发的文件
+# 🔴 2026-10-26 审查 C-3 修复：judge.py 从「单文件模块」变成了「模块 + 数据文件」，
+#    分发清单必须同步，否则用户端拿到新 judge.py 却没有日历 → 判定整块失效
+#    （实测：有日历 state_a=true+开窗+入场；无日历只剩一句"本月尚未收完"）。
+#    格式："文件名" = Python 模块（查函数标记）；"文件名:json" = JSON 数据（查结构标记）
+SIDE_MODULES = [
+    "judge.py",
+    "trading_calendar_months.json:json",   # 月末交易日历（约 34KB）
+    "finance_symbols.json:json",          # SA-06 金融标的名单（约 10KB）
+]
 VERSION_URL_API = "https://api.github.com/repos/emilesu/holdle-data-skill/contents/version.json"
 VERSION_URL_RAW = "https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/version.json"
 # 国内镜像源（仅 jsDelivr CDN；ghproxy.net 第三方代理已移除，MITM 风险）
@@ -245,9 +253,10 @@ def _auto_update(new_ver, restart=True):
         _side_ok, _side_fail = [], []
         for _mod in SIDE_MODULES:
             _mcontent = None
-            for _u in (f"https://api.github.com/repos/emilesu/holdle-data-skill/contents/{_mod}",
-                       f"https://cdn.jsdelivr.net/gh/emilesu/holdle-data-skill@master/{_mod}",
-                       f"https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/{_mod}"):
+            _remote_name = _mod.split(":", 1)[0]
+            for _u in (f"https://api.github.com/repos/emilesu/holdle-data-skill/contents/{_remote_name}",
+                       f"https://cdn.jsdelivr.net/gh/emilesu/holdle-data-skill@master/{_remote_name}",
+                       f"https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/{_remote_name}"):
                 try:
                     _rq = _urlreq.Request(_u, headers={"User-Agent": "holdle-data/1.0"})
                     with _urlreq.urlopen(_rq, timeout=15) as _rs:
@@ -261,17 +270,35 @@ def _auto_update(new_ver, restart=True):
                 except Exception:
                     continue
             if not _mcontent:
-                _side_fail.append(_mod)
+                _side_fail.append(_fname)
                 continue
-            # 安全检查：必须是本 skill 的判定模块（防止投毒下发任意代码）
+            # 安全检查：按类型校验内容（防止投毒下发任意文件）
+            _fname, _kind = (_mod.split(":", 1) + ["py"])[:2]
             _mtxt = _mcontent.decode("utf-8", errors="ignore")
-            if "HOLDLE 判定模块 judge.py" not in _mtxt or "def judge(" not in _mtxt:
-                _side_fail.append(_mod + "(内容校验失败)")
-                continue
+            if _kind == "json":
+                # JSON 数据文件：必须可解析，且含预期结构标记
+                try:
+                    _mj = _json.loads(_mtxt)
+                except Exception:
+                    _side_fail.append(_fname + "(JSON 解析失败)")
+                    continue
+                if _fname.startswith("trading_calendar"):
+                    _ok = ("months" in _mj) and isinstance(_mj.get("months"), dict)
+                elif _fname.startswith("finance_symbols"):
+                    _ok = ("symbols" in _mj) and isinstance(_mj.get("symbols"), dict)
+                else:
+                    _ok = False
+                if not _ok:
+                    _side_fail.append(_fname + "(结构校验失败)")
+                    continue
+            else:
+                if "HOLDLE 判定模块 judge.py" not in _mtxt or "def judge(" not in _mtxt:
+                    _side_fail.append(_fname + "(内容校验失败)")
+                    continue
             try:
-                with open(os.path.join(_base_dir, _mod), "wb") as _mf:
+                with open(os.path.join(_base_dir, _fname), "wb") as _mf:
                     _mf.write(_mcontent)
-                _side_ok.append(_mod)
+                _side_ok.append(_fname)
             except Exception as _me:
                 _side_fail.append(f"{_mod}(写入失败:{_me})")
         if _side_ok:
@@ -1098,6 +1125,7 @@ def main():
     #    后复权序列只用于历史复盘，不能拿来判状态A。
     # 🔴 必须喂**未取整**的日线原始价，不能读回 CSV（CSV 里 MACD 已 round(2)，
     #    会让贴0轴 |柱|/|DEA|<0.03 的临界月翻转，实测 167 个月里 4 个月落在临界带）。
+    _judge_ok = False
     if adjust == "forward" and not daily.empty:
         try:
             import judge as _judge
@@ -1121,6 +1149,7 @@ def main():
                     print(f"  [结构化] 入场参考价={_e['ref_price']}（{_e['status']}）")
             print(f"  💾 已存 {code}_判定.json（模型只能转述 final_text，不得自算）")
             print("=" * 70)
+            _judge_ok = True
         except Exception as _e:
             print(f"\n  ⚠️ 判定未生成（{_e}）；行情数据不受影响，仍可正常使用。")
             print("     若持续失败请 --auto-update 更新脚本或反馈给 HOLDLE。")
@@ -1130,7 +1159,16 @@ def main():
 
     print("\n" + "=" * 70)
     print(f"获取完成 ✅ 数据已保存到: {out_dir}")
-    print(f"复权口径：{adj_label}。判定（如有）已按 HOLDLE 方法论由脚本算出，模型只做转述。")
+    print(f"复权口径：{adj_label}。")
+    # 🔴 判定状态必须显式说清，不能含糊成「如有」——否则模型会以为有判定而自行发挥
+    if adjust == "forward" and not daily.empty:
+        if _judge_ok:
+            print(f"判定：已生成（模型只能转述 {code}_判定.json 的 final_text，不得自算）")
+        else:
+            print("判定：❌ 本次未生成（原因见上方告警）。请勿用你的推理替代判定结果，")
+            print("      应告知用户「本次未能生成方法论判定」，并按 fallback_unknown 话术回应。")
+    elif adjust != "forward":
+        print("判定：本次未做（后复权模式不做判定，判定口径固定前复权）。")
     print("=" * 70)
 
 

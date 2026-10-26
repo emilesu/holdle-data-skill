@@ -25,9 +25,33 @@ judge = pytest.importorskip("judge")
 
 
 def make_daily(n=1500, seed=7, start="2015-01-05"):
-    """合成日K（随机游走，工作日）。只用于结构测试，不用于口径验证。"""
+    """合成日K（随机游走，工作日）。只用于结构测试，不用于口径验证。
+
+    🔴 2026-10-26 修正：数据必须**截到真实的月末交易日**。
+       原实现任意截止（如 2020-10-02），而日历判据正确地把月中截止当"未收完"
+       → 12 个种子全部停在「本月尚未收完」分支，状态A/开窗/入场整条主路径走不到，
+       测试虽"通过"却是空转（被 assert checked > 0 自检抓到）。
+       现从 trading_calendar_months.json 里取真实末交易日作为截止日。
+    """
     rng = np.random.default_rng(seed)
     dates = pd.bdate_range(start, periods=n)
+    # 截到「日历里真实存在的月末交易日」，保证 month_closed 能成立
+    try:
+        import json as _json, os as _os
+        _cal = _json.load(open(_os.path.join(_os.path.dirname(_os.path.abspath(judge.__file__)),
+                                             "trading_calendar_months.json"), encoding="utf-8"))
+        _cn = _cal["months"]["cn"]
+        # 🔴 必须找「不晚于数据末日」的月末交易日；否则会截到未来日期（等于没截）
+        _base = dates[-1].to_period("M")
+        for _back in range(0, 8):
+            _ym = str(_base - _back)
+            _last = _cn.get(_ym)
+            if _last and pd.Timestamp(_last) <= dates[-1]:
+                dates = dates[dates <= pd.Timestamp(_last)]
+                break
+    except Exception:
+        pass
+    n = len(dates)
     ret = rng.normal(0.0004, 0.018, n)
     close = 10 * np.exp(np.cumsum(ret))
     high = close * (1 + np.abs(rng.normal(0, 0.008, n)))
@@ -164,7 +188,7 @@ class TestWindowClosedNoRefPrice:
 class TestAsOfReplay:
     def test_replay_declaration_first(self):
         d = make_daily()
-        a = str(d["date"].iloc[-200].date())
+        a = str((d["date"] - pd.offsets.MonthEnd(0)).iloc[-200].date())
         r = judge.judge(d, code="600519", as_of=a)
         units = r["required_statement"]["units"]
         if units and units[0]["code"] == "R-ASOF-REPLAY":
