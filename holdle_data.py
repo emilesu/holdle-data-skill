@@ -59,7 +59,7 @@ except ImportError:
     ak = None
 
 # ── 版本与更新（2026-08-19 新增自更新机制，2026-08-25 安全加固） ──────
-VERSION = "1.0.11"                      # skill 包版本（与 version.json 对齐）
+VERSION = "1.0.12"                      # skill 包版本（与 version.json 对齐）
 
 # 🔴 v1.0.8（2026-10-26）：自更新从「只更新自己」扩展为「更新自己 + 附属模块」。
 #   背景：judge.py（判定模块）是 v1.0.8 新增的附属文件，只更新 holdle_data.py 会导致

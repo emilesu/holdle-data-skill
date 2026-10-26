@@ -791,11 +791,21 @@ def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None):
         out["required_statement"]["units"] = [_unit(20, "R-DATA-QUALITY",
             "行情数据存在非正或全空的价格，无法判定。请重新拉取数据后重试。")]
         return _finalize(out)
-    _ratio = (_px.max() / _px.min()).max()
-    if _ratio > 1e4:
+    # 🔴 2026-10-26 导师终审 medium 修复：原用「全序列 max/min > 1e4」判污染，
+    #    但该比值随上市年限单调增长 → 会误伤真实超长期标的
+    #    （实测 WMT 51,150、MSFT 10,230、NVDA 7,455，全是 40~50 年真实增长+拆股，零污染）。
+    #    改用知识库 l1_engine 的判据：**月对月收盘跳变 >20 倍**才算污染
+    #    （MSFT/WMT/AAPL/NVDA 该指标实测全为 0，最大月跳变 1.5~1.8；真正混入未复权价会瞬间命中）。
+    try:
+        _mc = daily.set_index("date")["close"].resample("ME").last().dropna()
+        _jumps = (_mc / _mc.shift(1)).dropna()
+        _bad_jump = int(((_jumps > 20) | (_jumps < 0.05)).sum())
+    except Exception:
+        _bad_jump = 0
+    if _bad_jump > 0:
         out["status"] = "indeterminate"; out["indeterminate_reason"] = "data_quality"
         out["required_statement"]["units"] = [_unit(20, "R-DATA-QUALITY",
-            "行情数据的价格跨度异常（疑似复权口径不一致），无法判定。请重新拉取数据后重试。")]
+            "行情数据存在异常的月度跳变（疑似复权口径不一致），无法判定。请重新拉取数据后重试。")]
         return _finalize(out)
 
     # ---- as_of 截断（必须早于任何指标计算）----
@@ -860,7 +870,9 @@ def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None):
         out["required_statement"]["units"].append(_unit(2, "R-ASOF-BEYOND",
             "注意：行情数据只到 %s，所问的 %s 还没有数据；以下判定只能基于 %s 为止的数据，"
             "不代表 %s 的状态。" % (_de, as_of, _de, as_of)))
-    if as_of and lag > 0:
+    # 🔴 2026-10-26 对抗性审查 M-D：as_of 越界时，R-ASOF-BEYOND 已说明"所问日期还没有数据"，
+    #    此处就不能再说"以下判定基于截至该日的数据"——两句直接打架。
+    if as_of and lag > 0 and not as_of_beyond_data:
         out["required_statement"]["units"].append(_unit(3, "R-ASOF-REPLAY",
             "（历史回放）以下判定基于截至 %s 的行情数据，距当前已 %d 天；"
             "描述的是那一天的状态，不代表此后发生的情况。" % (as_of, lag)))
