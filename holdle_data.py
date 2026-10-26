@@ -6,7 +6,9 @@ HOLDLE 行情数据获取脚本（用户版 v0.4）
 这是 HOLDLE 提供给用户的「纯数据抓取器」：
 - 只抓取公开行情数据（月K/周K/日K/实时行情/财报）
 - 只计算公开标准指标（MACD 12/26/9）
-- ⚠️ 不含任何 HOLDLE 方法论判断（状态A/开窗/优先级等判断由你的 AI 助手完成）
+- 🤖 取数 + **确定性判定**：本脚本负责拉行情/财务数据，并在前复权模式下自动产出
+  `{code}_判定.json`（状态A/开窗/入场参考价由脚本按方法论确定性计算，模型只能转述 final_text、不得自算）；
+  企业质量、行情段资格、出场管理等需人工判断的部分仍由 AI 助手/用户按规则表处理
 
 数据逻辑以 HOLDLE 最新导出脚本 export_data（2026-08 版）为准：
   月K/周K/日K → datasource.py（新浪A股 / Yahoo 港美股，原始价+复权因子现算，全量）
@@ -63,7 +65,7 @@ except ImportError:
     ak = None
 
 # ── 版本与更新（2026-08-19 新增自更新机制，2026-08-25 安全加固） ──────
-VERSION = "1.1.7"                      # skill 包版本（与 version.json 对齐）
+VERSION = "1.2.0"                      # skill 包版本（与 version.json 对齐）
 
 # 🔴 v1.0.8（2026-10-26）：自更新从「只更新自己」扩展为「更新自己 + 附属模块」。
 #   背景：judge.py（判定模块）是 v1.0.8 新增的附属文件，只更新 holdle_data.py 会导致
@@ -103,7 +105,7 @@ ADJUST_MAP = {
     "backward": {"label": "后复权"},
     "forward":  {"label": "前复权"},
 }
-DEFAULT_ADJUST = "backward"
+DEFAULT_ADJUST = "forward"
 
 
 # ═══════════════════════════════════════════════════
@@ -822,7 +824,7 @@ def main():
         print("  A股示例:  600519  603259  000858")
         print("  美股示例:  NVDA    AAPL    MSFT")
         print("  港股示例:  hk_00700  hk_09988")
-        print("  --adjust: backward=后复权(默认,历史复盘/回测) forward=前复权(当前时点判断)")
+        print("  --adjust: forward=前复权(默认，HOLDLE 判定统一口径) backward=后复权(仅作历史数据对照，不参与判定)")
         print("  --update: 检查更新（仅提示）")
         print("  --auto-update: 检查并自动下载覆盖（⚠️ 覆盖脚本文件，请确认来源可信）")
         print("  --version: 显示当前版本")
@@ -1017,8 +1019,8 @@ def main():
             print(f"\n  ⚠️ 判定未生成（{_e}）；行情数据不受影响，仍可正常使用。")
             print("     若持续失败请 --auto-update 更新脚本或反馈给 HOLDLE。")
     elif adjust != "forward":
-        print("\n  ℹ️ 本次为后复权（历史复盘），未做状态A判定——判定口径固定为前复权。")
-        print("     需要当前状态判定请用：--adjust forward")
+        print("\n  ℹ️ 本次为后复权——仅作历史数据对照，不参与 HOLDLE 判定。")
+        print("     HOLDLE 判定与价格对账一律用前复权，请改用默认参数或显式传 --adjust forward")
 
     print("\n" + "=" * 70)
     print(f"获取完成 ✅ 数据已保存到: {out_dir}")

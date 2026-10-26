@@ -395,6 +395,10 @@ def _to_qfq(daily: pd.DataFrame, factors: pd.DataFrame, adjust: str = "forward")
             "拒绝以脏数据判定。请重试；若持续出现请反馈给 HOLDLE。" % (int(_fac_bad.sum()), len(_px)))
     if _raw_bad.any():
         out.loc[_raw_bad, ["qfq_close", "qfq_open", "qfq_high", "qfq_low"]] = float("nan")
+    # 🔴 2026-10-26 代码审查 CRITICAL-3：backward 模式用的是 hfq 因子，但列名恒为 qfq_*，
+    #    to_bars()/judge() 无差别读取 → 会把后复权价当前复权价喂进判定（实测 600519 差 8.9 倍）。
+    #    现在给 DataFrame 打上口径标记，下游据此拒绝。
+    out.attrs["holdle_adjust"] = adjust
     return out
 
 
@@ -527,6 +531,12 @@ def to_bars(daily: pd.DataFrame, freq: str = "M") -> pd.DataFrame:
     使用 qfq_* 列（前复权）——用户看到的 CSV 与判定用的是**同一份复权价**，
     这是「只有一套取数」的关键：不再出现"展示用一套、判定用另一套"。
     """
+    # 🔴 2026-10-26 代码审查 CRITICAL-3：只接受前复权序列做重采样/判定。
+    #    backward 序列的列名同样是 qfq_*，不检查就会把后复权价当判定输入。
+    if daily.attrs.get("holdle_adjust") == "backward":
+        raise DataUnavailable(
+            "to_bars 只接受前复权序列：HOLDLE 判定与报价统一前复权，"
+            "后复权仅作历史数据对照、不参与判定。请用 adjust='forward' 取数。")
     d = daily.copy()
     d["date"] = pd.to_datetime(d["date"])
     for c in ("open", "high", "low", "close"):
