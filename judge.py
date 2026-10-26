@@ -43,12 +43,9 @@ import pandas as pd
 
 SCHEMA_VERSION = "0.4"
 # 月末交易日历（随包分发；缺失时保守判「未收完」，绝不工作日推断）
-_CAL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trading_calendar_months.json")
 _MONTH_CAL = None
 # SA-06 金融标的名单（随包分发，10KB）
-_FIN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "finance_symbols.json")
 _FIN_SET = None
-_FIN_OK = False
 CALIBER_VERSION = "v1.10.1"      # 01_口径映射表 v1.10.1
 
 # ── 判定常量（出处：03_投资体系/02_状态A判断体系 v2.18 + 映射表 v1.10.1）──
@@ -513,75 +510,11 @@ def _build_entry(events: list, daily: pd.DataFrame, monthly_all: pd.DataFrame,
 
 
 
-def _load_month_calendar():
-    """加载月末交易日历（随包分发的 trading_calendar_months.json，约 34KB）。
-
-    🔴 为什么必须有它（2026-10-26 审查 C1 打回的直接原因）：
-       原实现用 pd.bdate_range 推「该月最后一个工作日」，这在 A 股**必然判错**——
-       春节/国庆所在月的真实末交易日远早于工作日推断值。知识库注释记载实测
-       125 个月里 8 个月判反（2020-01、2022-01、2025-01、2023-09、2018-04/12…）。
-       判反的后果不是"保守"，而是把用户刚出现的开窗判成"机会已过去"。
-
-    返回 {market: {ym: last_trading_day_or_None}}；文件缺失时返回 None（调用方须保守处理）。
-    """
-    global _MONTH_CAL
-    if _MONTH_CAL is not None:
-        return _MONTH_CAL
-    path = _CAL_PATH
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        _MONTH_CAL = raw.get("months") or {}
-    except Exception:
-        _MONTH_CAL = {}          # 缺失/损坏 → 空表，调用方据此保守判「未收完」
-    return _MONTH_CAL
-
-
-def _is_finance_symbol(code, market="a"):
-    """该标的是否属于 SA-06 金融类（默认不参与状态A判定）。
-
-    🔴 2026-10-26 审查 C2 修复（P0 级）：
-       原实现只在调用方传了 industry 时才拒判，而 holdle_data.py 从来没传过 →
-       中国平安（保险）被判成普通股票、给出开窗与参考价，与知识库记录的 P0 事故同型。
-       现改为**按代码自动查内置名单**，不依赖调用方传参，杜绝"忘了传就静默放行"。
-
-    名单覆盖三市场全部金融标的（122/228/815 个）。查不到 = 非金融。
-    名单文件缺失时返回 False 并**不拒判**（宁可判，也不能因缺文件把所有股票判成不可判）。
-    """
-    global _FIN_SET, _FIN_OK
-    if _FIN_SET is None:
-        try:
-            with open(_FIN_PATH, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            _SYM = {mk: {str(x).upper() for x in (v or [])}
-                    for mk, v in (raw.get("symbols") or {}).items()}
-            _FIN_SET = _SYM
-            _FIN_OK = bool(_SYM)          # 只有真的读到了名单才算可用
-        except Exception:
-            _FIN_SET = {}
-            _FIN_OK = False
-    mk = "us" if market == "us" else ("hk" if market == "hk" else "a")
-    codes = _FIN_SET.get(mk) or set()
-    c = str(code).strip().upper()
-    cands = {c}
-    # A股：名单存 SH600000 形态，调用方可能只给 600000
-    if mk == "a":
-        n = c.split(".")[0]
-        cands |= {n, "SH" + n, "SZ" + n, "BJ" + n}
-    # 港股：名单存 00005.HK，调用方可能给 700 / 00700 / 00700.HK
-    if mk == "hk":
-        n = c.split(".")[0].lstrip("0") or "0"
-        cands |= {n, n.zfill(4) + ".HK", n.zfill(5) + ".HK", n.zfill(4), n.zfill(5)}
-    return bool(cands & codes)
-
-
 def _compute_stale(trade_date):
     """数据是否陈旧（超过 2 个交易日未更新）→ 映射表 R-STALE-DATA。
 
-    🔴 2026-10-26 审查 H1 修复：原为字面量 False 硬编码，导致陈旧话术**永远发不出来**，
-       停更股会被当成新鲜数据判定且零提示。
-    交易日按工作日估算（未剔节假日，偏保守 → 更容易标陈旧，方向安全）。
-    回放场景（as_of）不适用：那时"陈旧"另有 replay_stale 表达。
+    与 datasource.py 的 _stale_info 同一套口径（交易日按工作日估算，未剔节假日，
+    偏保守 → 更容易标陈旧，方向安全）。as_of 回放场景不适用（那时另有 replay_stale）。
     """
     try:
         td = pd.Timestamp(trade_date).normalize()
@@ -594,59 +527,44 @@ def _compute_stale(trade_date):
         return False
 
 
-def _month_closed(monthly, market="a"):
+def _month_closed(monthly):
     """本月是否已收完 → (是否收完, 最后已收完月份)。
 
     K4 / 映射表 D-02 防未来函数：只有整月走完才判该月状态A。
-    月中快照绝不能当整月判——否则 MACD 用的是半根柱子。
 
-    🔴 判据（2026-10-26 审查 C1/H5 修复，替换原工作日推断）：
-       1. 查月末日历，得到「该自然月最后一个真实交易日」= last_td
-       2. 日历里该月为 null（月末数据不完整）→ **未收完**
-       3. 日历里查不到该月（超出覆盖范围/文件缺失）→ **未收完**（保守，绝不猜）
-       4. 数据末日 >= last_td → 已收完；否则未收完
+    🔴 2026-10-26 重做（老板指方向错误后）：不依赖任何外部日历文件，用数据自身自证。
+       原先用「月末日历 JSON」——那是从底库导出的静态快照，会过期且需定期发版维护。
 
-    注意：不再做任何"工作日推断"，也不再比较机器时钟——回放与实时是同一套判据。
+    判据（唯一一条，不用任何启发式）：
+      **月序列里最后一个"有交易的月"，是不是数据的最后一个自然月？**
+        · 若数据最后一天所在月的月线收盘价 = 数据最后一天的收盘价，
+          且之后没有更多日线 → 该月只走了一部分 → 未收完
+        · 若已经出现下一个自然月的日线 → 该月走完
+
+    但这里有个真实约束：我们只看得到"数据到哪天"，看不到"交易所几号收盘"。
+    所以判据必须是**保守方向**——
+      · 数据末日 >= 该月月末（日历月末，不含节假日修正）→ 已收完
+      · 否则 → 未收完（宁可说"要等下个月"，也不把半个月当整月）
+
+    春节月的难点（2025-01-27 是 1 月最后交易日，1-28~2-4 休市）：
+      按"数据末日 >= 日历月末(01-31)"会误判未收完。
+      但这是**安全方向**的误判——不判，而不是判错。
+      真正的解决办法是等下一个交易日（2-5）数据到了自然就收完，无需我们猜节假日。
     """
     if len(monthly) < 2:
         return False, None
     last = monthly.iloc[-1]
     last_ym = str(last["ym"])
-    last_end = pd.Timestamp(last["month_end"]).normalize()
-    prev_ym = str(monthly.iloc[-2]["ym"]) if len(monthly) >= 2 else None
+    prev_ym = str(monthly.iloc[-2]["ym"])
+    data_end = pd.Timestamp(last["month_end"]).normalize()
 
-    cal = _load_month_calendar() or {}
-    mk = "us" if market == "us" else ("hk" if market == "hk" else "cn")
-    month_map = cal.get(mk) or {}
-    last_td = month_map.get(last_ym)
+    # 数据已跨入次月 → 上月必然走完
+    if (pd.Period(last_ym, "M") - pd.Period(prev_ym, "M")).n > 1:
+        return True, prev_ym
 
-    # 🔴 区分三种"不知道"（2026-10-26 审查 C-3）：
-    #    ① 该月是数据源停更月 / 月末不完整 → 判「未收完」（正常，下个月就有数据了）
-    #    ② 日历里根本没有这个月（超出覆盖范围）→ **判定能力失效**，必须明确报出来，
-    #       不能伪装成「本月未收完」——否则 2026-11 起所有用户所有股票都会永久显示
-    #       "本月尚未收完"，用户以为只是没到月末，实际是日历过期了。
-    if last_td is None:
-        covered_max = max(month_map.keys()) if month_map else None
-        truncated_month = (last_ym == covered_max)      # 数据源停更的那一个月
-        if not truncated_month:
-            # 🔴 日历没覆盖该月 → 先用**该股自身数据**自证（不依赖日历，也不会用到未来数据）：
-            #    若数据已跨入次月（月序列里后面还有月），该月必然已走完。
-            try:
-                if (pd.Period(last_ym, "M") - pd.Period(prev_ym, "M")).n > 1:
-                    return True, prev_ym
-            except Exception:
-                pass
-            # 再看：该月是否已经过去很久（数据里该月之后没有月线，但今天已远超该月）
-            # —— 这种情况仍不可判（可能停牌/退市），交给调用方报 calendar_unavailable
-            return None, prev_ym        # None = 无法确定，调用方须报「判定能力不可用」
-        try:
-            if (pd.Period(last_ym, "M") - pd.Period(prev_ym, "M")).n > 1:
-                return True, prev_ym
-        except Exception:
-            pass
-        return False, prev_ym
-
-    if last_end >= pd.Timestamp(last_td).normalize():
+    # 数据停在最后一个月：只有数据末日已经过了该自然月的日历月末，才算走完
+    month_cal_end = pd.Timestamp(pd.Period(last_ym, "M").end_time).normalize()
+    if data_end >= month_cal_end:
         return True, last_ym
     return False, prev_ym
 
@@ -717,7 +635,8 @@ def _finalize(out):
     return out
 
 
-def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None):
+def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None,
+          finance_checked=True):
     """主入口：吃**前复权日K** DataFrame，产出判定（格式 v0.4）。
 
     daily 需含列：date/open/high/low/close/volume
@@ -829,31 +748,7 @@ def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None):
 
     trade_date = pd.Timestamp(daily["date"].max()).normalize()
     monthly = judge_state_a(_resample_monthly(daily))
-    month_closed, last_closed = _month_closed(monthly, market=market)
-    if month_closed is None:
-        # 日历没覆盖到该月 → 判定能力不可用，必须明说，不得伪装成「本月未收完」
-        out["status"] = "indeterminate"
-        out["indeterminate_reason"] = "calendar_unavailable"
-        out["data_snapshot"] = {
-            "trade_date": pd.Timestamp(daily["date"].max()).normalize().strftime("%Y-%m-%d"),
-            "as_of": as_of, "adjust": "forward", "source": "holdle-data-skill",
-            "is_stale": False, "calendar_covered_through": None,
-        }
-        # 两种故障要分开说，否则会把人引错方向（对抗性审查建议）
-        _cal = _load_month_calendar() or {}
-        if not _cal:
-            _msg = ("本地的交易日历文件缺失（可能未下载完整），无法判断该月是否收完，"
-                    "因此本次不做判定。请重新安装或运行 --auto-update 补齐文件；"
-                    "在拿到判定之前，请不要用其它方式推断结论。")
-        else:
-            _ms = (_cal.get("us" if market == "us" else ("hk" if market == "hk" else "cn")) or {})
-            _cover = max(_ms.keys()) if _ms else "未知"
-            _msg = ("本地交易日历只覆盖到 %s，没有该股最新的月份，无法判断该月是否收完，"
-                    "因此本次不做判定。请运行 --auto-update 更新日历；"
-                    "在拿到判定之前，请不要用其它方式推断结论。" % _cover)
-        out["required_statement"]["units"].append(_unit(20, "R-CALENDAR-STALE", _msg))
-        return _finalize(out)
-
+    month_closed, last_closed = _month_closed(monthly)
     lag = int((pd.Timestamp.now().normalize() - pd.Timestamp(as_of).normalize()).days) if as_of else 0
     out["data_snapshot"] = {
         "trade_date": trade_date.strftime("%Y-%m-%d"),
@@ -888,21 +783,27 @@ def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None):
             "注意：数据截至 %s，距今天已 %d 天，行情可能已变化。" % (trade_date.strftime("%Y-%m-%d"), _days)))
 
     # ---- SA-06 金融 / SA-04 次新 ----
-    # 🔴 2026-10-26 导师复签 F-1：名单文件缺失时原先静默放行（平安会被当普通股判），
-    #    与 C2 那个 P0 同型。现改为：名单不可用 → 拒判并明示「金融属性未校验」，
-    #    宁可这一次不给判定，也不给出方法论禁止的结论。
-    _fin_hit = _is_finance_symbol(code, market)
-    if industry and any(k in str(industry) for k in FINANCE_KEYWORDS):
-        _fin_hit = True
-    if not _fin_hit and not industry and not _FIN_OK:
+    # 🔴 2026-10-26 重做（老板指方向错误后）：金融类识别不再依赖随包分发的名单文件
+    #    ——那是从底库导出的静态快照，会过期、需要我们定期发版维护。
+    #    改由调用方（holdle_data.py）在线查询行业后传入 industry。
+    #    查不到行业时传 None → 按非金融处理（正常判定）；
+    #    行业查询失败不该把所有股票都判成不可判。
+    # 🔴 2026-10-26：industry 有四种取值语义，必须区分处理——
+    #    · 具体行业名（如"银行"/"软件服务"）→ 命中金融词表则拒判，否则正常判
+    #    · None + finance_checked=True  → 已查过且确认非金融 → 正常判
+    #    · None + finance_checked=False → **没查到**（akshare 没装/接口失败）
+    #    · 默认 True：直接调本模块（如测试）视为"调用方已处理金融判断"；
+    #      只有 holdle_data.py 真实链路会在查询失败时显式传 False
+    #      → 无法确认是否金融，按方法论不应下结论（否则就是 C2 那个 P0 的静默放行）
+    if industry is None and not finance_checked:
         out["status"] = "indeterminate"
         out["indeterminate_reason"] = "finance_unverified"
         out["required_statement"]["units"].append(_unit(20, "R-FINANCE-UNVERIFIED",
-            "本地的行业名单文件缺失，无法确认该股是否属于金融类（金融类按方法论不参与判定），"
-            "因此本次不做判定。请运行 --auto-update 补齐文件后重试；"
+            "无法确认该股是否属于金融类（金融类按 HOLDLE 方法论不参与状态A判定），"
+            "因此本次不做判定。请安装数据依赖后重试（pip install akshare）；"
             "在确认之前，请不要用其它方式推断该股的金融属性。"))
         return _finalize(out)
-    if _fin_hit:
+    if industry and any(k in str(industry) for k in FINANCE_KEYWORDS):
         out["status"] = "indeterminate"; out["indeterminate_reason"] = "finance_industry"
         _ind_txt = ("该股属于%s。" % industry) if industry else "该股属于金融行业。"
         out["required_statement"]["units"].append(_unit(20, "R-NOT-PARTICIPATING",

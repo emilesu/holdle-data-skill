@@ -45,6 +45,17 @@ from datetime import datetime
 
 import pandas as pd
 
+# 🔴 取数统一走 datasource.py（回测试验同源：新浪/Yahoo 原始价 + 复权因子现算）
+try:
+    import datasource as _ds
+    _ds_load_daily = _ds.load_daily
+    _ds_to_bars = _ds.to_bars
+except Exception as _e:  # noqa: BLE001
+    _ds = None
+    _ds_load_daily = None
+    _ds_to_bars = None
+    _DS_IMPORT_ERROR = _e
+
 try:
     import baostock as bs
 except ImportError:
@@ -59,7 +70,7 @@ except ImportError:
     ak = None
 
 # ── 版本与更新（2026-08-19 新增自更新机制，2026-08-25 安全加固） ──────
-VERSION = "1.0.12"                      # skill 包版本（与 version.json 对齐）
+VERSION = "1.1.0"                      # skill 包版本（与 version.json 对齐）
 
 # 🔴 v1.0.8（2026-10-26）：自更新从「只更新自己」扩展为「更新自己 + 附属模块」。
 #   背景：judge.py（判定模块）是 v1.0.8 新增的附属文件，只更新 holdle_data.py 会导致
@@ -70,9 +81,8 @@ VERSION = "1.0.12"                      # skill 包版本（与 version.json 对
 #    （实测：有日历 state_a=true+开窗+入场；无日历只剩一句"本月尚未收完"）。
 #    格式："文件名" = Python 模块（查函数标记）；"文件名:json" = JSON 数据（查结构标记）
 SIDE_MODULES = [
-    "judge.py",
-    "trading_calendar_months.json:json",   # 月末交易日历（约 34KB）
-    "finance_symbols.json:json",          # SA-06 金融标的名单（约 10KB）
+    "datasource.py",       # 取数层（新浪/Yahoo 原始价 + 复权因子现算，与回测试验同源）
+    "judge.py",            # 判定层（状态A/开窗/入场参考价，只转述 final_text）
 ]
 VERSION_URL_API = "https://api.github.com/repos/emilesu/holdle-data-skill/contents/version.json"
 VERSION_URL_RAW = "https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/version.json"
@@ -294,7 +304,8 @@ def _auto_update(new_ver, restart=True):
                     _side_fail.append(_fname + "(结构校验失败)")
                     continue
             else:
-                if "HOLDLE 判定模块 judge.py" not in _mtxt or "def judge(" not in _mtxt:
+                if not (("HOLDLE 判定模块 judge.py" in _mtxt and "def judge(" in _mtxt)
+                        or ("HOLDLE 取数模块 datasource.py" in _mtxt and "def load_daily(" in _mtxt)):
                     _side_fail.append(_fname + "(内容校验失败)")
                     continue
             _staged.append((_fname, _mcontent))
@@ -357,224 +368,6 @@ def parse_code(code):
     if re.match(r'^[A-Z]{1,5}\.', code):
         return "us", code.split('.')[0]
     return "a", code.zfill(6)
-
-
-# ═══════════════════════════════════════════════════
-#  代码转换
-# ═══════════════════════════════════════════════════
-def _is_bj(code):
-    """北交所代码判断：43xxxx/83xxxx/87xxxx 及 920xxx 新段。沪市6/深市0、3除外。"""
-    return code.startswith(('4', '8', '92'))
-
-
-def code_to_baostock(code, market='a'):
-    """A股代码转 Baostock 格式。北交所（4/8/92 开头）Baostock 不支持，返回 None。"""
-    if market == 'a':
-        if _is_bj(code):
-            return None
-        prefix = 'sh' if code.startswith('6') or code.startswith('9') else 'sz'
-        return f"{prefix}.{code}"
-    return None
-
-
-def code_to_tickflow(code, market='a'):
-    """A股/美股/港股代码转 TickFlow 格式（2026-08-19 实测：600519.SH / NVDA.US / 00700.HK）
-    北交所（4/8/92 开头）TickFlow 不支持，返回 None 让主流程直接走新浪兜底。"""
-    if market == 'a':
-        if _is_bj(code):
-            return None
-        return f"{code}.SH" if code.startswith('6') else f"{code}.SZ"
-    if market == 'us':
-        return f"{code}.US"
-    if market == 'hk':
-        return f"{code}.HK"
-    return code
-
-
-# ═══════════════════════════════════════════════════
-#  TickFlow K线（主用，后复权，A/港/美三市场）
-# ═══════════════════════════════════════════════════
-def _standardize_tickflow(df):
-    """TickFlow 返回统一为标准列 date/open/high/low/close/volume"""
-    if df is None or df.empty:
-        return pd.DataFrame()
-    df = df.rename(columns={'trade_date': 'date'})
-    df['date'] = pd.to_datetime(df['date'])
-    df = df.sort_values('date').reset_index(drop=True)
-    keep = [c for c in ['date', 'open', 'high', 'low', 'close', 'volume'] if c in df.columns]
-    return df[keep]
-
-
-def _drop_partial_last(df, now, freq):
-    """剔除「进行中」的当月/当周 partial bar（月末/周五结算后不误删完整K线）"""
-    if df is None or df.empty:
-        return df
-    last = df.iloc[-1]['date']
-    if freq == 'M':
-        same_month = (last.year == now.year and last.month == now.month)
-        if same_month:
-            import calendar
-            last_day_of_month = calendar.monthrange(now.year, now.month)[1]
-            is_month_end = now.day >= last_day_of_month - 1
-            if not is_month_end:
-                return df.iloc[:-1].reset_index(drop=True)
-        return df
-    else:  # 'w'
-        last_week = last.isocalendar()[:2]
-        now_week = now.isocalendar()[:2]
-        if last_week == now_week and now.weekday() < 4:
-            return df.iloc[:-1].reset_index(drop=True)
-        return df
-
-
-def fetch_tickflow_monthly(symbol_tf, drop_partial=True, adjust="backward"):
-    """TickFlow 月K（period='1M'），默认剔除进行中的当月。adjust: backward(后复权)/forward(前复权)"""
-    if TickFlow is None:
-        print("  ⚠️ tickflow 未安装（pip3 install tickflow）")
-        return pd.DataFrame()
-    try:
-        tf = TickFlow.free()
-        df = tf.klines.get(symbol_tf, period='1M', count=2000, adjust=adjust, as_dataframe=True)
-        df = _standardize_tickflow(df)
-        if df.empty:
-            return df
-        if drop_partial:
-            df = _drop_partial_last(df, datetime.now(), 'M')
-        return df
-    except Exception as e:
-        print(f"  ⚠️ TickFlow 月K异常: {e}")
-        return pd.DataFrame()
-
-
-def fetch_tickflow_weekly(symbol_tf, drop_partial=True, adjust="backward"):
-    """TickFlow 周K（period='1w'），默认剔除进行中的当周。adjust: backward/forward"""
-    if TickFlow is None:
-        print("  ⚠️ tickflow 未安装（pip3 install tickflow）")
-        return pd.DataFrame()
-    try:
-        tf = TickFlow.free()
-        df = tf.klines.get(symbol_tf, period='1w', count=2000, adjust=adjust, as_dataframe=True)
-        df = _standardize_tickflow(df)
-        if df.empty:
-            return df
-        if drop_partial:
-            df = _drop_partial_last(df, datetime.now(), 'w')
-        return df
-    except Exception as e:
-        print(f"  ⚠️ TickFlow 周K异常: {e}")
-        return pd.DataFrame()
-
-
-def fetch_tickflow_daily(symbol_tf, adjust="backward"):
-    """TickFlow 日K（count=10000）。adjust: backward/forward"""
-    if TickFlow is None:
-        print("  ⚠️ tickflow 未安装（pip3 install tickflow）")
-        return pd.DataFrame()
-    try:
-        tf = TickFlow.free()
-        df = tf.klines.get(symbol_tf, count=10000, adjust=adjust, as_dataframe=True)
-        df = _standardize_tickflow(df)
-        return df
-    except Exception as e:
-        print(f"  ⚠️ TickFlow 日K异常: {e}")
-        return pd.DataFrame()
-
-
-# ═══════════════════════════════════════════════════
-#  Baostock K线（降级兜底，仅A股）
-# ═══════════════════════════════════════════════════
-def fetch_baostock_kline(symbol_bs, frequency, adjustflag="1"):
-    """Baostock K线通用（frequency: 'm'/'w'）。adjustflag: 1=后复权 2=前复权"""
-    if bs is None:
-        return pd.DataFrame()
-    for attempt in range(MAX_RETRIES):
-        try:
-            lg = bs.login()
-            if lg.error_code != '0':
-                print(f"  ⚠️ Baostock 登录失败: {lg.error_msg}")
-                return pd.DataFrame()
-            rs = bs.query_history_k_data_plus(
-                symbol_bs,
-                fields='date,open,high,low,close,volume,amount',
-                start_date=BAOSTOCK_START_DATE,
-                end_date=BAOSTOCK_END_DATE,
-                frequency=frequency,
-                adjustflag=adjustflag
-            )
-            data_list = []
-            while rs.next():
-                row = rs.get_row_data()
-                if row[0] is not None:
-                    data_list.append(row)
-            bs.logout()
-            if not data_list:
-                print(f"  ⚠️ Baostock {frequency}K无数据: {symbol_bs}")
-                return pd.DataFrame()
-            df = pd.DataFrame(data_list, columns=rs.fields)
-            for col in ['open', 'high', 'low', 'close', 'volume', 'amount']:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            df['date'] = pd.to_datetime(df['date'])
-            df = df.sort_values('date').reset_index(drop=True)
-            return df[['date', 'open', 'high', 'low', 'close', 'volume', 'amount']]
-        except Exception as e:
-            print(f"  ⚠️ Baostock {frequency}K异常（第{attempt+1}次）: {e}")
-            time.sleep(RETRY_DELAY)
-    return pd.DataFrame()
-
-
-def fetch_baostock_monthly(symbol_bs, adjustflag="1"):
-    return fetch_baostock_kline(symbol_bs, 'm', adjustflag)
-
-
-def fetch_baostock_weekly(symbol_bs, adjustflag="1"):
-    return fetch_baostock_kline(symbol_bs, 'w', adjustflag)
-
-
-# ═══════════════════════════════════════════════════
-#  新浪 K线（兜底，支持沪深+北交所；日K重采样月/周）
-# ═══════════════════════════════════════════════════
-def _a_sina_prefix(code):
-    """A股/北交所新浪前缀：6→sh(沪)、北交所(4/8/92)→bj、其余→sz(深)"""
-    if code.startswith('6'):
-        return 'sh'
-    if _is_bj(code):
-        return 'bj'
-    return 'sz'
-
-
-def fetch_sina_kline(code, freq, adjust="backward"):
-    """新浪 A股/北交所 K线兜底（stock_zh_a_daily，日K；月/周从日K重采样）。
-    freq: 'D'/'W'/'M'；adjust: backward→hfq(后复权) forward→qfq(前复权)。
-    覆盖沪深市与北交所（TickFlow/Baostock 不支持北交所时用此兜底）。"""
-    if ak is None:
-        return pd.DataFrame()
-    try:
-        adj = 'hfq' if adjust == "backward" else 'qfq'
-        prefix = _a_sina_prefix(code)
-        df = ak.stock_zh_a_daily(symbol=f"{prefix}{code}", adjust=adj)
-        if df is None or df.empty:
-            return pd.DataFrame()
-        df['date'] = pd.to_datetime(df['date'])
-        df = df.sort_values('date').reset_index(drop=True)
-        if freq == 'D':
-            return df[['date', 'open', 'high', 'low', 'close', 'volume']]
-        # 月/周：日K重采样（W=周末、ME=月末；兼容 pandas 新旧 'W'/'ME' 写法）
-        s = df.set_index('date')
-        rule = 'ME' if freq == 'M' else 'W'
-        try:
-            res = s.resample(rule).agg(
-                {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).dropna()
-        except Exception:
-            res = s.resample('M' if freq == 'M' else 'W').agg(
-                {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).dropna()
-        res = res.reset_index().rename(columns={'index': 'date'})
-        # 剔除进行中的当月/当周 partial bar
-        res = res[['date', 'open', 'high', 'low', 'close', 'volume']]
-        res = _drop_partial_last(res, datetime.now(), 'M' if freq == 'M' else 'w')
-        return res
-    except Exception as e:
-        print(f"  ⚠️ 新浪K线({freq})异常: {e}")
-        return pd.DataFrame()
 
 
 # ═══════════════════════════════════════════════════
@@ -957,6 +750,52 @@ def calc_macd(df, fast=12, slow=26, signal=9):
 
 
 # ═══════════════════════════════════════════════════
+#  行业查询（SA-06 金融类判定用，在线获取，不背静态名单）
+# ═══════════════════════════════════════════════════
+def _lookup_industry(code, market='a'):
+    """查该股所属行业 → (industry 或 None, 是否真的查到了)。
+
+    🔴 2026-10-26：原先我用随包分发的 finance_symbols.json（底库静态名单），会过期。
+       改为在线查询（A股/港股/美股分别走 AkShare 对应接口）。
+
+    🔴 返回值必须是二元组，因为两种 None 语义完全不同：
+       ("银行", True)  → 查到且是金融
+       ("软件服务", True) → 查到且非金融 → 正常判定
+       (None, False)   → **没查到** → 无法确认是否金融 → 按方法论不判（拒绝静默放行）
+    """
+    try:
+        import akshare as ak
+    except Exception:
+        return None, False
+    try:
+        if market == 'a':
+            df = ak.stock_individual_info_em(symbol=code)
+            if df is not None and not df.empty and 'item' in df.columns:
+                row = df[df['item'].astype(str).str.contains('行业', na=False)]
+                if not row.empty:
+                    return str(row.iloc[0]['value']).strip(), True
+        elif market == 'hk':
+            df = ak.stock_hk_company_profile_em(symbol=code)
+            if df is not None and not df.empty:
+                for col in ('所属行业', '行业', 'industry'):
+                    if col in df.columns:
+                        v = str(df.iloc[0][col]).strip()
+                        if v and v.lower() not in ('nan', 'none', ''):
+                            return v, True
+        else:
+            df = ak.stock_us_company_profile_em(symbol=code)
+            if df is not None and not df.empty:
+                for col in ('所属行业', '行业', 'industry'):
+                    if col in df.columns:
+                        v = str(df.iloc[0][col]).strip()
+                        if v and v.lower() not in ('nan', 'none', ''):
+                            return v, True
+    except Exception:
+        return None, False
+    return None, False
+
+
+# ═══════════════════════════════════════════════════
 #  主流程（TickFlow 主用 → Baostock 降级）
 # ═══════════════════════════════════════════════════
 def main():
@@ -996,6 +835,19 @@ def main():
         sys.exit(1)
     raw_code = args[0].strip()
     market, code = parse_code(raw_code)
+    # datasource 需要的代码形态：A股 600519.SH / 港股 00700.HK / 美股 NVDA
+    if market == 'hk':
+        _sym = '%05d.HK' % int(re.sub(r'\D', '', code) or 0) if re.sub(r'\D', '', code) else code
+    elif market == 'a':
+        _pre = 'SH' if code.startswith(('6', '5', '9')) else ('BJ' if code.startswith(('8', '4')) else 'SZ')
+        _sym = '%s.%s' % (code, _pre)
+    else:
+        _sym = code.upper()
+    if _ds is None:
+        print('  ❌ 缺少取数模块 datasource.py（或其依赖 requests/pyarrow）')
+        print('     %s' % globals().get('_DS_IMPORT_ERROR', ''))
+        print('     请重新运行 --auto-update，或 git pull 后重试。')
+        sys.exit(2)
     out_dir = args[1].strip() if len(args) > 1 else os.path.join(os.getcwd(), 'holdle_data')
     os.makedirs(out_dir, exist_ok=True)
 
@@ -1020,8 +872,6 @@ def main():
     _check_update(force=True, auto=True)
 
     name = code
-    sym_tf = code_to_tickflow(code, market)
-    bs_code = code_to_baostock(code, market) if market == 'a' else None
 
     # ── 0. 实时行情 ─────────────────────────────
     print("\n[0/5] 实时行情...")
@@ -1072,69 +922,40 @@ def main():
     else:
         print("  ❌ 财报获取失败")
 
-    # ── 2. 月K线（TickFlow 主用 → Baostock 降级 → 新浪兜底） ─
-    print(f"\n[2/5] 月K线（{adj_label}）+ MACD...")
-    monthly = fetch_tickflow_monthly(sym_tf, adjust=adj_tf)
-    monthly_src = 'TickFlow'
-    if monthly.empty and bs_code:
-        print("  ⚠️ TickFlow 月K不可用，降级到 Baostock...")
-        monthly = fetch_baostock_monthly(bs_code, adjustflag=adj_bs)  # 2026-09-14 修：原漏传 → 降级时口径退回后复权
-        monthly_src = 'Baostock(降级)'
-    if monthly.empty and market == 'a':
-        print("  ⚠️ TickFlow/Baostock 月K不可用，降级到 新浪（支持北交所）...")
-        monthly = fetch_sina_kline(code, 'M', adjust)
-        monthly_src = '新浪(降级)'
-    if not monthly.empty:
-        dif, dea, mbar = calc_macd(monthly)
-        monthly['DIF'] = dif.round(2)
-        monthly['DEA'] = dea.round(2)
-        monthly['MACD柱'] = mbar.round(2)
-        monthly.to_csv(f"{out_dir}/{code}_月K_{adj_label}.csv", index=False)
-        print(f"  ✅ 月K {monthly['date'].min().date()} ~ {monthly['date'].max().date()}，共 {len(monthly)} 条（来源: {monthly_src}，{adj_label}）")
-        print(f"  💾 已存 {code}_月K_{adj_label}.csv（含 DIF/DEA/MACD柱）")
-        show = monthly.tail(24)[['date', 'close', 'DIF', 'DEA', 'MACD柱']].copy()
-        show.columns = ['日期', '收盘', 'DIF', 'DEA', '柱']
-        print("\n=== 月K最近24条（含MACD指标）===")
-        print(show.to_string(index=False))
-    else:
-        print("  ❌ 月K获取失败")
+    # ── 2/3/4. K线（月/周/日）—— 统一走 datasource（回测试验同源取数方式） ─
+    # 🔴 2026-10-26 换源（老板确认：不需要两套）：原先 TickFlow 主用 → Baostock → 新浪兜底，
+    #    现统一为「新浪(A股) / Yahoo(港美股) 原始价 + 复权因子现算」，与回测试验、底库完全同源。
+    #    收益：复权可复算、口径与回测逐位一致、无 key 依赖；代价：不设二级源，
+    #    失败即明确报错（不再用另一个源的数据顶替——那会让口径悄悄变化）。
+    print(f"\n[2/4] K线（{adj_label}）...")
+    try:
+        daily_full, meta = _ds_load_daily(_sym, adjust=adjust)
+    except _ds.DataUnavailable as e:
+        print(f"  ❌ 行情数据获取失败：{e}")
+        print("     按 HOLDLE 口径，此时不做判定、也不用旧数据顶替。")
+        print("     请检查网络后重试；若持续失败请反馈给 HOLDLE。")
+        daily_full = None
+        meta = None
 
-    # ── 3. 周K线（TickFlow 主用 → Baostock 降级 → 新浪兜底） ─
-    print(f"\n[3/5] 周K线（{adj_label}）+ MACD...")
-    weekly = fetch_tickflow_weekly(sym_tf, adjust=adj_tf)
-    if weekly.empty and bs_code:
-        print("  ⚠️ TickFlow 周K不可用，降级到 Baostock...")
-        weekly = fetch_baostock_weekly(bs_code, adjustflag=adj_bs)
-    if weekly.empty and market == 'a':
-        print("  ⚠️ TickFlow/Baostock 周K不可用，降级到 新浪（支持北交所）...")
-        weekly = fetch_sina_kline(code, 'W', adjust)
-    if not weekly.empty:
-        dif, dea, mbar = calc_macd(weekly)
-        weekly['DIF'] = dif.round(2)
-        weekly['DEA'] = dea.round(2)
-        weekly['MACD柱'] = mbar.round(2)
-        weekly.to_csv(f"{out_dir}/{code}_周K_{adj_label}.csv", index=False)
-        print(f"  ✅ 周K {weekly['date'].min().date()} ~ {weekly['date'].max().date()}，共 {len(weekly)} 条（{adj_label}）")
-        print(f"  💾 已存 {code}_周K_{adj_label}.csv")
-    else:
-        print("  ⚠️ 周K获取失败")
+    if daily_full is not None:
+        print(f"  ✅ 日线 {daily_full['date'].min().date()} ~ {daily_full['date'].max().date()}"
+              f"，共 {len(daily_full)} 根（源={meta.source}，缓存={meta.from_cache}）")
+        if meta.is_stale:
+            print(f"  ⚠️ 数据截至 {meta.trade_date}，距今天已 {meta.stale_days} 天")
+        if meta.is_partial and meta.partial_note:
+            print(f"  ⚠️ {meta.partial_note}")
 
-    # ── 4. 日K线（TickFlow → 新浪兜底） ──────────
-    print(f"\n[4/5] 日K线（TickFlow Free，{adj_label}）+ MACD...")
-    daily = fetch_tickflow_daily(sym_tf, adjust=adj_tf)
-    if daily.empty and market == 'a':
-        print("  ⚠️ TickFlow 日K不可用，降级到 新浪（支持北交所）...")
-        daily = fetch_sina_kline(code, 'D', adjust)
-    if not daily.empty:
-        dif, dea, mbar = calc_macd(daily)
-        daily['DIF'] = dif.round(2)
-        daily['DEA'] = dea.round(2)
-        daily['MACD柱'] = mbar.round(2)
-        daily.to_csv(f"{out_dir}/{code}_日K_{adj_label}.csv", index=False)
-        print(f"  ✅ 日K {daily['date'].min().date()} ~ {daily['date'].max().date()}，共 {len(daily)} 条（{adj_label}）")
-        print(f"  💾 已存 {code}_日K_{adj_label}.csv")
+        for _freq, _label, _fname in (("M", "月K", "月K"), ("W", "周K", "周K"), ("D", "日K", "日K")):
+            _bars = _ds_to_bars(daily_full, _freq)
+            _bars.to_csv(f"{out_dir}/{code}_{_fname}_{adj_label}.csv", index=False)
+            print(f"  💾 已存 {code}_{_fname}_{adj_label}.csv（{len(_bars)} 根，含 DIF/DEA/MACD柱）")
+        # 终端展示最近 12 根月K
+        _show = _ds_to_bars(daily_full, "M").tail(12)[["date", "close", "DIF", "DEA", "MACD柱"]].copy()
+        _show.columns = ["日期", "收盘", "DIF", "DEA", "柱"]
+        print("\n=== 月K最近12根（含MACD指标）===")
+        print(_show.to_string(index=False))
     else:
-        print("  ⚠️ 日K获取失败")
+        daily = pd.DataFrame()
 
     # ── 判定（2026-10-26 新增）：状态A/开窗/入场参考价由脚本算，模型只转述 ──
     # 🔴 只在"现状判断"（前复权）时做判定：判定口径是前复权（裁决#1），
@@ -1142,10 +963,15 @@ def main():
     # 🔴 必须喂**未取整**的日线原始价，不能读回 CSV（CSV 里 MACD 已 round(2)，
     #    会让贴0轴 |柱|/|DEA|<0.03 的临界月翻转，实测 167 个月里 4 个月落在临界带）。
     _judge_ok = False
-    if adjust == "forward" and not daily.empty:
+    _has_daily = daily_full is not None and not daily_full.empty
+    if adjust == "forward" and _has_daily:
         try:
             import judge as _judge
-            _j = _judge.judge(daily, code=code, market=market, stock_name=None)
+            # 金融类(SA-06)行业：在线查询（查不到传 None → 按非金融正常判定）
+            _industry, _fin_checked = _lookup_industry(code, market)
+            _j = _judge.judge(daily_full, code=code, market=market,
+                              stock_name=None, industry=_industry,
+                              finance_checked=_fin_checked)
             _jpath = f"{out_dir}/{code}_判定.json"
             _judge.dump(_j, _jpath)
             print("\n" + "=" * 70)
@@ -1177,7 +1003,7 @@ def main():
     print(f"获取完成 ✅ 数据已保存到: {out_dir}")
     print(f"复权口径：{adj_label}。")
     # 🔴 判定状态必须显式说清，不能含糊成「如有」——否则模型会以为有判定而自行发挥
-    if adjust == "forward" and not daily.empty:
+    if adjust == "forward" and _has_daily:
         if _judge_ok:
             print(f"判定：已生成（模型只能转述 {code}_判定.json 的 final_text，不得自算）")
         else:
