@@ -525,3 +525,67 @@ class TestNumericLocks:
     def test_macd_params_locked(self):
         """SA-02 MACD 参数 12/26/9 不可调。"""
         assert (judge.FAST, judge.SLOW, judge.SIG) == (12, 26, 9)
+
+
+# ── 10. 金融四态语义锁（2026-10-26 导师/对抗性审查，同一 bug 换位置复发两次）──
+class TestFinanceStatusMatrix:
+    """金融状态必须四态分明，且**互斥**（不能同时触发拒判与告警）。
+
+    🔴 由来：这个 bug 已经复发两次——
+       第一次：告警挂在流程中段，被早退分支跳过（告警丢）
+       第二次：if/elif 写法让 'empty' 之外的 status 短路告警（nodep 时告警丢）
+       根因都是「把两件独立的事写成互斥判断」+「判据分散在两处（finance_checked / finance_status）」。
+       现在判据收敛为基于 finance_status 的单一判定，本测试锁死四种行为的组合。
+    """
+
+    def test_nodep_judges_with_warning(self):
+        r = judge.judge(make_daily(), code="601318", industry=None,
+                        finance_checked=False, finance_status="nodep")
+        codes = [u["code"] for u in r["required_statement"]["units"]]
+        assert r["status"] == "judged", "缺依赖不该拒判（否则没装 akshare 的用户全不可用）"
+        assert "R-FINANCE-UNCHECKED" in codes
+        assert "未能核验该股的金融属性" in r["required_statement"]["final_text"]
+        assert "R-FINANCE-UNVERIFIED" not in codes
+
+    def test_error_judges_with_warning(self):
+        r = judge.judge(make_daily(), code="601318", industry=None,
+                        finance_checked=False, finance_status="error")
+        codes = [u["code"] for u in r["required_statement"]["units"]]
+        assert r["status"] == "judged"
+        assert "R-FINANCE-UNCHECKED" in codes
+
+    def test_empty_rejects_without_warning(self):
+        """属性不明 → 拒判；**不应**再叠一条「未校验」告警（那是两种不同的事）。"""
+        r = judge.judge(make_daily(), code="601318", industry=None,
+                        finance_checked=False, finance_status="empty")
+        codes = [u["code"] for u in r["required_statement"]["units"]]
+        assert r["status"] == "indeterminate"
+        assert r["indeterminate_reason"] == "finance_unverified"
+        assert "R-FINANCE-UNVERIFIED" in codes
+        assert "R-FINANCE-UNCHECKED" not in codes, "拒判时不该再叠「未校验」告警（冗余）"
+        assert r["state_a"] is None and r["window"] is None and r["entry"] is None
+
+    def test_found_non_finance_judges_silently(self):
+        r = judge.judge(make_daily(), code="600519", industry="白酒",
+                        finance_checked=True, finance_status="found")
+        codes = [u["code"] for u in r["required_statement"]["units"]]
+        assert r["status"] != "indeterminate" or r["indeterminate_reason"] != "finance_unverified"
+        assert "R-FINANCE-UNCHECKED" not in codes
+        assert "R-FINANCE-UNVERIFIED" not in codes
+
+    def test_found_finance_rejects(self):
+        r = judge.judge(make_daily(), code="601318", industry="保险",
+                        finance_checked=True, finance_status="found")
+        assert r["status"] == "indeterminate"
+        assert r["indeterminate_reason"] == "finance_industry"
+        assert "R-NOT-PARTICIPATING" in [u["code"] for u in r["required_statement"]["units"]]
+
+    def test_no_status_dual_trigger(self):
+        """任何一种 status 下，两个金融单元都不得同时出现（互斥性）。"""
+        for st, fc in [("nodep", False), ("error", False), ("empty", False),
+                       ("found", True), (None, True)]:
+            r = judge.judge(make_daily(), code="601318", industry=None,
+                            finance_checked=fc, finance_status=st)
+            codes = [u["code"] for u in r["required_statement"]["units"]]
+            both = ("R-FINANCE-UNCHECKED" in codes) and ("R-FINANCE-UNVERIFIED" in codes)
+            assert not both, "status=%r 时两个金融单元同时出现（互斥性被破坏）" % st

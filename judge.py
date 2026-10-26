@@ -631,6 +631,7 @@ def _finalize(out):
                        ("R-STATE-A", "R-WINDOW-OPEN", "R-WINDOW-CLOSED", "R-STICKY",
                         "R-REF-PRICE", "R-BREAKOUT-YES", "R-BREAKOUT-NO", "R-MISS5",
                         "R-NO-GREEN", "R-WINDOW-EXPIRED", "R-REF-VOID", "R-DEA-ZERO")]
+        rs["units"] = [u for u in rs["units"] if u.get("code") != "R-FINANCE-UNCHECKED"]
         rs["units"].append({"seq": 20, "code": "R-FINANCE-UNVERIFIED",
             "text": "无法确认该股是否属于金融类（查询结果没有给出行业信息）。"
                     "金融类按 HOLDLE 方法论不参与状态A判定，资格不明时不做判定；"
@@ -679,9 +680,15 @@ def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None,
     #   'nodep'/'error' = 这次没能力查（没装 akshare / 接口挂）→ 照常判 + 告警
     # 早期版本把两者合并成 finance_checked=False 一律"判+告警"，导师判定处置偏松：
     # 「无法确认是否金融」是**资格问题**，资格不明不该下结论。
+    # 金融状态三选一，语义互斥（2026-10-26 对抗性审查指出 elif 写法有坑，
+    # 但真正的问题是"两个标记同时被设"。这里改成**基于 status 的单一判定**，
+    # 不依赖调用方另传的 finance_checked 布尔，避免两处判据不一致）：
+    #   'empty'         → 属性不明 → 拒判（资格问题，不下结论）
+    #   'nodep'/'error' → 这次没能力查 → 照常判 + 告警
+    #   'found'/None    → 已校验或调用方自行处理 → 不额外加东西
     if finance_status == "empty":
         out["_finance_unconfirmed"] = True
-    elif not finance_checked:
+    elif finance_status in ("nodep", "error") or (finance_status is None and not finance_checked):
         out["_finance_unchecked"] = True
 
     if daily is None or len(daily) == 0:
