@@ -88,9 +88,42 @@ monthly = pd.read_csv(f"{OUT}/{code}_月K_{adjust_label}.csv")
 同时调用 **holdle_ask** 工具检索方法论片段（如「状态A判断」「入场流程」「交易管理」）。
 调用 **holdle_get_rules** 获取校准规则时，传与 holdle_ask 相同的 `round_id`，同一次提问只扣 1 次。
 
-### Step 3：结合分析并输出
+### Step 3：🔴 读取判定结果（2026-10-26 新增，优先级最高）
 
-按 HOLDLE 方法论组织回答，**必须注明复权口径**：
+脚本在**前复权**模式下会自动产出一份 `{code}_判定.json`，里面是**脚本按方法论算好的结论**。
+
+**你要做的是「转述」，不是「判断」：**
+
+```
+读取 {OUT}/{code}_判定.json
+→ 把 required_statement.final_text 原样转述给用户
+```
+
+🔴 **硬纪律（违反即失真）：**
+
+1. **只能转述 `final_text`**。不要自己拿 CSV 里的 DIF/DEA/MACD柱 再算一遍——
+   判定用的是**未取整**的原始值，CSV 里是 `round(2)`，你自己算会得出不同结论。
+2. **禁止自算任何数字**：价格、百分比、日期、天数，一律从 json 里取。
+3. `status != "judged"` 时（如金融股、次新股、本月未收完），**只能原样说明原因**，
+   不得按「一般理解」补一个结论。
+4. `final_text` 没覆盖的问题，用 `required_statement.fallback_unknown` 的话术回应。
+5. 后复权模式（历史复盘）**不做判定**——判定口径固定为前复权。要判当前状态请用 `--adjust forward`。
+
+**判定 json 里有什么：**
+
+| 字段 | 含义 |
+|:--|:--|
+| `status` | `judged`（有结论）/ `indeterminate`（不可判，写明原因） |
+| `state_a` | 状态A：`status`/`month`/`month_closed`/`conditions`/`sticky_zero` |
+| `window` | 开窗事件：`event`（绿转红/矮转高）/ `event_month` / `alive.is_alive` |
+| `entry` | 入场参考价：`ref_price` / `status`（已突破/未突破/不追/过期） |
+| `required_statement.final_text` | 🔴 **唯一可以转述给用户的文本** |
+| `human_judgement_required` | 脚本**不能**判、必须人工的条款（如企业质量、持仓状态） |
+
+### Step 4：结合分析并输出
+
+**判定类问题**（是不是状态A / 有没有开窗 / 入场参考价）：直接转述 `final_text`，再按需补充方法论讲解。
+**方法论讲解类问题**：用 holdle_ask 检索到的片段组织回答，**必须注明复权口径**。
 
 > 「以下分析基于 {前复权/后复权} 数据。月K MACD 双线 {≥/＜}0轴、柱子 {红/绿}……按 HOLDLE 方法论……」
 
@@ -102,7 +135,8 @@ monthly = pd.read_csv(f"{OUT}/{code}_月K_{adjust_label}.csv")
    - ✅「当前价 1307.88（前复权）」
    - ✅「2015-06 高点 1399.71（后复权）」
    - ❌ 只报价格不报口径
-2. **判断逻辑来自 holdle_ask 检索的方法论片段**，不凭空编造
+2. **判断逻辑来自 holdle_ask 检索的方法论片段 + 脚本产出的判定 json**，不凭空编造；
+   有判定 json 时，结论**一律以 json 的 final_text 为准**，方法论片段只用于解释
 3. **红线**：不荐股、不预测、不承诺收益；结论型问题引导用户自己判断
 4. **风险声明**：回答末尾附「以上为 HOLDLE 方法论知识讲解，不构成投资建议」
 

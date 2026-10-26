@@ -33,11 +33,12 @@ HOLDLE 行情数据获取脚本（用户版 v0.4）
   TickFlow Free（三市场 K 线）· Baostock（A股降级）· AkShare（财报）· 腾讯/新浪（实时）
 """
 import warnings
+
 warnings.filterwarnings('ignore')
 
-import sys
 import os
 import re
+import sys
 import time
 import urllib.request as urlreq
 from datetime import datetime
@@ -58,7 +59,13 @@ except ImportError:
     ak = None
 
 # ── 版本与更新（2026-08-19 新增自更新机制，2026-08-25 安全加固） ──────
-VERSION = "1.0.7"                      # skill 包版本（与 version.json 对齐）
+VERSION = "1.0.8"                      # skill 包版本（与 version.json 对齐）
+
+# 🔴 v1.0.8（2026-10-26）：自更新从「只更新自己」扩展为「更新自己 + 附属模块」。
+#   背景：judge.py（判定模块）是 v1.0.8 新增的附属文件，只更新 holdle_data.py 会导致
+#   老用户升级后 holdle_data.py 里 import judge 找不到文件 → 判定静默失效。
+#   原则：附属模块缺失只降级（告警 + 不判定），绝不让整个数据拉取失败。
+SIDE_MODULES = ["judge.py"]           # 与主脚本同目录、需随版本一起分发的文件
 VERSION_URL_API = "https://api.github.com/repos/emilesu/holdle-data-skill/contents/version.json"
 VERSION_URL_RAW = "https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/version.json"
 # 国内镜像源（仅 jsDelivr CDN；ghproxy.net 第三方代理已移除，MITM 风险）
@@ -172,9 +179,9 @@ def _auto_update(new_ver, restart=True):
     """自动下载新版脚本覆盖自己。从固定 HTTPS URL 下载。
     restart=True 时更新完成后用 os.execv 以新版代码重启继续本次任务；
     restart=False 时更新完成后退出（供 --auto-update 显式命令使用）。"""
-    import urllib.request as _urlreq
     import base64 as _b64
     import json as _json  # v1.0.4 修复：此前漏 import 导致 GitHub API 段 NameError，静默降级 CDN 缓存旧版
+    import urllib.request as _urlreq
 
     script_url_api = "https://api.github.com/repos/emilesu/holdle-data-skill/contents/holdle_data.py"
     script_url_raw = "https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/holdle_data.py"
@@ -232,6 +239,46 @@ def _auto_update(new_ver, restart=True):
                     os.remove(old_path)
                 except Exception:
                     pass
+        # ── 附属模块分发（v1.0.8）──
+        # 任一附属模块下载失败只告警，不阻断主脚本更新（主功能优先）
+        _base_dir = os.path.dirname(self_path)
+        _side_ok, _side_fail = [], []
+        for _mod in SIDE_MODULES:
+            _mcontent = None
+            for _u in (f"https://api.github.com/repos/emilesu/holdle-data-skill/contents/{_mod}",
+                       f"https://cdn.jsdelivr.net/gh/emilesu/holdle-data-skill@master/{_mod}",
+                       f"https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/{_mod}"):
+                try:
+                    _rq = _urlreq.Request(_u, headers={"User-Agent": "holdle-data/1.0"})
+                    with _urlreq.urlopen(_rq, timeout=15) as _rs:
+                        _raw = _rs.read()
+                    if "api.github.com" in _u:
+                        _mcontent = _b64.b64decode(_json.loads(_raw.decode("utf-8")).get("content", "") or "")
+                    else:
+                        _mcontent = _raw
+                    if _mcontent:
+                        break
+                except Exception:
+                    continue
+            if not _mcontent:
+                _side_fail.append(_mod)
+                continue
+            # 安全检查：必须是本 skill 的判定模块（防止投毒下发任意代码）
+            _mtxt = _mcontent.decode("utf-8", errors="ignore")
+            if "HOLDLE 判定模块 judge.py" not in _mtxt or "def judge(" not in _mtxt:
+                _side_fail.append(_mod + "(内容校验失败)")
+                continue
+            try:
+                with open(os.path.join(_base_dir, _mod), "wb") as _mf:
+                    _mf.write(_mcontent)
+                _side_ok.append(_mod)
+            except Exception as _me:
+                _side_fail.append(f"{_mod}(写入失败:{_me})")
+        if _side_ok:
+            print(f"  ✅ 附属模块已更新: {', '.join(_side_ok)}")
+        if _side_fail:
+            print(f"  ⚠️ 附属模块未能更新: {', '.join(_side_fail)}（判定功能暂不可用，数据拉取不受影响）")
+
         print(f"  ✅ 已更新到 v{new_ver}（旧版备份: {os.path.basename(backup)}）")
         if restart:
             # 标记本次已更新，防止重启后再次触发更新导致死循环
@@ -724,7 +771,6 @@ def fetch_financials_a_ths(code):
     CSV 字段全部对不上、经营现金流等指标「数据未覆盖」为空。"""
     fin_df = ak.stock_financial_abstract_ths(symbol=code)
     fin_df = fin_df[fin_df['报告期'].str.contains('12-31', na=False)].tail(FIN_YEARS)
-    import math
     result = []
     for _, row in fin_df.iterrows():
         year = str(row.get('报告期', ''))[:4]
@@ -1047,10 +1093,44 @@ def main():
     else:
         print("  ⚠️ 日K获取失败")
 
+    # ── 判定（2026-10-26 新增）：状态A/开窗/入场参考价由脚本算，模型只转述 ──
+    # 🔴 只在"现状判断"（前复权）时做判定：判定口径是前复权（裁决#1），
+    #    后复权序列只用于历史复盘，不能拿来判状态A。
+    # 🔴 必须喂**未取整**的日线原始价，不能读回 CSV（CSV 里 MACD 已 round(2)，
+    #    会让贴0轴 |柱|/|DEA|<0.03 的临界月翻转，实测 167 个月里 4 个月落在临界带）。
+    if adjust == "forward" and not daily.empty:
+        try:
+            import judge as _judge
+            _j = _judge.judge(daily, code=code, market=market, stock_name=None)
+            _jpath = f"{out_dir}/{code}_判定.json"
+            _judge.dump(_j, _jpath)
+            print("\n" + "=" * 70)
+            print("📋 HOLDLE 方法论判定（脚本确定性计算，非模型推理）")
+            print("=" * 70)
+            print(_j["required_statement"]["final_text"])
+            if _j.get("state_a"):
+                _sa = _j["state_a"]
+                print(f"\n  [结构化] 状态={_sa['status']}  判定月={_sa['month']}  "
+                      f"本月已收完={_sa['month_closed']}")
+                _w = _j.get("window") or {}
+                if _w.get("event") and _w["event"] != "none":
+                    print(f"  [结构化] 开窗={_w['event']}@{_w['event_month']}  "
+                          f"存活={_w['alive']['is_alive']}")
+                _e = _j.get("entry") or {}
+                if _e.get("ref_price"):
+                    print(f"  [结构化] 入场参考价={_e['ref_price']}（{_e['status']}）")
+            print(f"  💾 已存 {code}_判定.json（模型只能转述 final_text，不得自算）")
+            print("=" * 70)
+        except Exception as _e:
+            print(f"\n  ⚠️ 判定未生成（{_e}）；行情数据不受影响，仍可正常使用。")
+            print("     若持续失败请 --auto-update 更新脚本或反馈给 HOLDLE。")
+    elif adjust != "forward":
+        print("\n  ℹ️ 本次为后复权（历史复盘），未做状态A判定——判定口径固定为前复权。")
+        print("     需要当前状态判定请用：--adjust forward")
+
     print("\n" + "=" * 70)
     print(f"获取完成 ✅ 数据已保存到: {out_dir}")
-    print(f"提示：以上为原始数据 + 公开指标（MACD），复权口径为 {adj_label}，不含任何投资判断。")
-    print("方法判断（状态A等）请交给你的 HOLDLE AI 助手完成。")
+    print(f"复权口径：{adj_label}。判定（如有）已按 HOLDLE 方法论由脚本算出，模型只做转述。")
     print("=" * 70)
 
 
