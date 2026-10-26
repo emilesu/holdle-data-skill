@@ -212,3 +212,174 @@ class TestAsOfReplay:
         r = judge.judge(make_daily(), code="600519")
         assert r["data_snapshot"]["as_of"] is None
         assert r["data_snapshot"]["replay_stale"] is False
+
+
+# ── 7. P0 修复的回归保护（2026-10-26 对抗性审查 H-A 要求）──────────
+# 🔴 由来：审查员把 `_build_entry` 的 expire_reason 分支改回旧写法（强制「入场有效期已过」），
+#    本测试文件当时**依然 24 全绿** —— 说明这条 P0 修复零回归保护，下次机械移植会原样复活。
+#    这里的用例必须做到：把修复改回去，测试要红。
+class TestP0RegressionGuards:
+    def test_data_end_must_not_say_expired(self):
+        """expire_reason == 'data_end'（数据到头、窗口仍存活）时，final_text 不得说「有效期已过」。"""
+        from datetime import date
+        # 构造一个价格先涨后横的序列，保证能开出窗口
+        rng = np.random.default_rng(11)
+        dates = pd.bdate_range("2023-01-02", "2025-12-31")
+        n = len(dates)
+        close = 10 * np.exp(np.cumsum(rng.normal(0.0006, 0.015, n)))
+        # 末段横盘：制造"窗口还开着但没突破"的场景
+        close[-40:] = close[-41]
+        d = pd.DataFrame({"date": dates, "open": close, "high": close * 1.002,
+                          "low": close * 0.998, "close": close, "volume": 1e5})
+        r = judge.judge(d, code="TEST")
+        en = r.get("entry") or {}
+        if en.get("expire_reason") == "data_end":
+            txt = r["required_statement"]["final_text"]
+            assert "入场有效期已过" not in txt, "data_end 分支不得说「有效期已过」"
+            assert ("入场等待继续有效" in txt) or ("窗口仍存活" in txt), "应说明窗口仍存活"
+        else:
+            pytest.skip("本次构造未命中 data_end 分支（expire_reason=%r）" % en.get("expire_reason"))
+
+    def test_window_alive_never_says_expired(self):
+        """窗口 is_alive=True 时，final_text 绝不能出现「入场有效期已过」。
+
+        用仓库内的真实缓存行情（随机游走造不出稳定的「窗口存活」场景，
+        synthetic 版本实测 20 个种子 0 命中 → 空转）。"""
+        import os
+        cand = []
+        for f in ("300308", "NVDA"):
+            p = os.path.join(ROOT, "holdle_data", "%s_日K_前复权.csv" % f)
+            if os.path.exists(p):
+                cand.append((f, p))
+        if not cand:
+            pytest.skip("仓库内无真实缓存行情，跳过")
+        hit = 0
+        for name, path in cand:
+            d = pd.read_csv(path, parse_dates=["date"])[["date", "open", "high", "low", "close", "volume"]]
+            for a in ("2026-04-30", "2026-05-29", "2025-12-31", None):
+                r = judge.judge(d, code=name, market=("us" if name == "NVDA" else "a"),
+                                **({"as_of": a} if a else {}))
+                alive = ((r.get("window") or {}).get("alive") or {}).get("is_alive")
+                txt = r["required_statement"]["final_text"]
+                if alive:
+                    hit += 1
+                    assert "入场有效期已过" not in txt, \
+                        "%s@%s 窗口存活却说有效期已过（自相矛盾）" % (name, a)
+        assert hit > 0, "真实数据里也没有窗口存活的情形，本测试空转"
+
+    def test_month_closed_calendar_spring_festival(self):
+        """春节月末必须按真实交易日判定：2025-01-27 是 1 月最后一个交易日 → 已收完；
+        2025-01-24（差一天）→ 未收完。这对用例正是日历驱动与工作日推断的分水岭。"""
+        rng = np.random.default_rng(3)
+        dates = pd.bdate_range("2015-01-05", "2025-01-31")
+        close = 10 * np.exp(np.cumsum(rng.normal(0.0004, 0.018, len(dates))))
+        base = pd.DataFrame({"date": dates, "open": close, "high": close * 1.01,
+                             "low": close * 0.99, "close": close, "volume": 1e5})
+        for anchor, expect in [("2025-01-27", True), ("2025-01-24", False)]:
+            sub = base[base["date"] <= pd.Timestamp(anchor)]
+            if len(sub) < 40:
+                pytest.skip("构造数据未覆盖 %s" % anchor)
+            m = judge._resample_monthly(sub)
+            got = judge._month_closed(m, "a")[0]
+            assert got is expect, "%s 判定期望 %s 实际 %s" % (anchor, expect, got)
+
+    def test_month_closed_other_holiday_months(self):
+        """国庆/清明等节假日月也要按真实交易日判定（工作日推断会判反）。"""
+        rng = np.random.default_rng(5)
+        dates = pd.bdate_range("2015-01-05", "2026-10-31")
+        close = 10 * np.exp(np.cumsum(rng.normal(0.0004, 0.018, len(dates))))
+        base = pd.DataFrame({"date": dates, "open": close, "high": close * 1.01,
+                             "low": close * 0.99, "close": close, "volume": 1e5})
+        for anchor, expect in [("2023-09-28", True), ("2023-09-27", False),
+                               ("2020-01-23", True), ("2020-01-22", False)]:
+            sub = base[base["date"] <= pd.Timestamp(anchor)]
+            m = judge._resample_monthly(sub)
+            got = judge._month_closed(m, "a")[0]
+            assert got is expect, "%s 判定期望 %s 实际 %s" % (anchor, expect, got)
+
+    def test_disclaimer_in_final_text(self):
+        """免责段必须进 final_text（模型只转述 final_text）。"""
+        r = judge.judge(make_daily(), code="TEST")
+        assert "不构成任何投资建议" in r["required_statement"]["final_text"]
+
+    def test_dirty_date_returns_structured(self):
+        """非法日期 → 结构化 data_quality，不得抛异常。"""
+        d = make_daily()
+        d = d.copy(); d["date"] = d["date"].astype(object); d.loc[5, "date"] = "2019-13-45"
+        r = judge.judge(d, code="TEST")
+        assert r["status"] == "indeterminate"
+        assert r["indeterminate_reason"] == "data_quality"
+
+    def test_dirty_price_returns_structured(self):
+        """非数字价格 → 结构化 data_quality，不得静默丢行后照常判。"""
+        d = make_daily().copy()
+        d["high"] = d["high"].astype(object); d.loc[10, "high"] = "abc"
+        r = judge.judge(d, code="TEST")
+        assert r["status"] == "indeterminate"
+        assert r["indeterminate_reason"] == "data_quality"
+
+
+# ── 8. 导师复签建议补的测试（2026-10-26）────────────────────────
+class TestMentorRecheckSuggestions:
+    def test_spring_festival_both_sides(self):
+        """春节月边界两侧：2020-01-22（差一天）vs 2020-01-23（真实末日）。"""
+        rng = np.random.default_rng(9)
+        dates = pd.bdate_range("2015-01-05", "2021-12-31")
+        close = 10 * np.exp(np.cumsum(rng.normal(0.0004, 0.018, len(dates))))
+        base = pd.DataFrame({"date": dates, "open": close, "high": close * 1.01,
+                             "low": close * 0.99, "close": close, "volume": 1e5})
+        for anchor, expect in [("2020-01-23", True), ("2020-01-22", False)]:
+            sub = base[base["date"] <= pd.Timestamp(anchor)]
+            m = judge._resample_monthly(sub)
+            got = judge._month_closed(m, "a")[0]
+            assert got is expect, "%s 期望 %s 实际 %s" % (anchor, expect, got)
+
+    def test_calendar_expired_reports_unavailable(self):
+        """模拟日历过期：数据跨到日历覆盖范围之后 → 必须 calendar_unavailable。"""
+        rng = np.random.default_rng(13)
+        dates = pd.bdate_range("2024-01-02", "2027-06-30")   # 超出日历（到 2026-10）
+        close = 10 * np.exp(np.cumsum(rng.normal(0.0004, 0.015, len(dates))))
+        d = pd.DataFrame({"date": dates, "open": close, "high": close * 1.01,
+                          "low": close * 0.99, "close": close, "volume": 1e5})
+        r = judge.judge(d, code="600519")
+        assert r["status"] == "indeterminate"
+        assert r["indeterminate_reason"] == "calendar_unavailable", \
+            "日历过期必须明确报不可用，不得伪装成「本月未收完」，实际=%r" % r["indeterminate_reason"]
+        assert r["state_a"] is None and r["window"] is None
+
+    def test_finance_list_missing_not_silent(self, monkeypatch):
+        """🔴 金融名单缺失时不得静默放行（F-1，与 C2 P0 同型）。"""
+        monkeypatch.setattr(judge, "_FIN_PATH", "/nonexistent/finance_symbols.json")
+        monkeypatch.setattr(judge, "_FIN_SET", None)
+        monkeypatch.setattr(judge, "_FIN_OK", False)
+        r = judge.judge(make_daily(), code="601318")
+        assert r["status"] == "indeterminate"
+        assert r["indeterminate_reason"] == "finance_unverified", \
+            "名单缺失应报 finance_unverified（拒绝静默放行），实际=%r" % r["indeterminate_reason"]
+
+    def test_no_awkward_phrase(self):
+        """H-1 病句：「数据截至的 X 这个月」多余「的」字。"""
+        rng = np.random.default_rng(17)
+        dates = pd.bdate_range("2025-01-02", "2026-10-16")   # 末日月中
+        close = 10 * np.exp(np.cumsum(rng.normal(0.0004, 0.015, len(dates))))
+        d = pd.DataFrame({"date": dates, "open": close, "high": close * 1.01,
+                          "low": close * 0.99, "close": close, "volume": 1e5})
+        txt = judge.judge(d, code="600519")["required_statement"]["final_text"]
+        assert "数据截至的 " not in txt, "病句仍在：%r" % txt[:60]
+
+    def test_replay_no_present_tense_in_window(self):
+        """H-2 回放时「该窗口目前仍存活」必须改成「当时」。"""
+        import os
+        p = os.path.join(ROOT, "holdle_data", "300308_日K_前复权.csv")
+        if not os.path.exists(p):
+            pytest.skip("无真实缓存行情")
+        d = pd.read_csv(p, parse_dates=["date"])[["date", "open", "high", "low", "close", "volume"]]
+        hit = 0
+        for a in ("2026-04-30", "2026-05-29", "2025-12-31"):
+            r = judge.judge(d, code="300308", as_of=a)
+            alive = ((r.get("window") or {}).get("alive") or {}).get("is_alive")
+            if alive:
+                hit += 1
+                txt = r["required_statement"]["final_text"]
+                assert "目前仍存活" not in txt, "%s 回放仍用「目前」，应改「当时」" % a
+        assert hit > 0, "无窗口存活场景，本测试空转"

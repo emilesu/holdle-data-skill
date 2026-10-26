@@ -48,6 +48,7 @@ _MONTH_CAL = None
 # SA-06 金融标的名单（随包分发，10KB）
 _FIN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "finance_symbols.json")
 _FIN_SET = None
+_FIN_OK = False
 CALIBER_VERSION = "v1.10.1"      # 01_口径映射表 v1.10.1
 
 # ── 判定常量（出处：03_投资体系/02_状态A判断体系 v2.18 + 映射表 v1.10.1）──
@@ -547,15 +548,18 @@ def _is_finance_symbol(code, market="a"):
     名单覆盖三市场全部金融标的（122/228/815 个）。查不到 = 非金融。
     名单文件缺失时返回 False 并**不拒判**（宁可判，也不能因缺文件把所有股票判成不可判）。
     """
-    global _FIN_SET
+    global _FIN_SET, _FIN_OK
     if _FIN_SET is None:
         try:
             with open(_FIN_PATH, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-            _FIN_SET = {mk: {str(x).upper() for x in (v or [])}
-                        for mk, v in (raw.get("symbols") or {}).items()}
+            _SYM = {mk: {str(x).upper() for x in (v or [])}
+                    for mk, v in (raw.get("symbols") or {}).items()}
+            _FIN_SET = _SYM
+            _FIN_OK = bool(_SYM)          # 只有真的读到了名单才算可用
         except Exception:
             _FIN_SET = {}
+            _FIN_OK = False
     mk = "us" if market == "us" else ("hk" if market == "hk" else "a")
     codes = _FIN_SET.get(mk) or set()
     c = str(code).strip().upper()
@@ -736,14 +740,45 @@ def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None):
         return _finalize(out)
 
     daily = daily.copy()
-    daily["date"] = pd.to_datetime(daily["date"])
-    daily = daily.sort_values("date").reset_index(drop=True)
+
+    # 🔴 2026-10-26 对抗性审查 H-B：脏数据（非法日期字符串 / 非数字价格）原先**直接抛异常**，
+    #    而 holdle_data.py 捕获后只打印"判定未生成" → 判定 json 不落盘 → 模型读不到文件，
+    #    连 fallback_unknown 话术也跟着丢了。这里把所有解析异常收敛为 data_quality 结构化返回。
     for c in ("open", "high", "low", "close"):
         if c not in daily.columns:
             out["status"] = "indeterminate"; out["indeterminate_reason"] = "data_missing"
             out["required_statement"]["units"] = [_unit(20, "R-DATA-MISSING",
                 "行情数据缺少必要列 %s，无法判定。" % c)]
             return _finalize(out)
+    try:
+        daily["date"] = pd.to_datetime(daily["date"])
+        for c in ("open", "high", "low", "close"):
+            daily[c] = pd.to_numeric(daily[c], errors="coerce")
+    except Exception as e:
+        out["status"] = "indeterminate"; out["indeterminate_reason"] = "data_quality"
+        out["required_statement"]["units"] = [_unit(20, "R-DATA-QUALITY",
+            "行情数据存在无法解析的日期或价格（%s），无法判定。请重新拉取数据后重试。"
+            % str(e)[:60])]
+        return _finalize(out)
+    if daily["date"].isna().any() or daily[["open", "high", "low", "close"]].isna().all(axis=None):
+        out["status"] = "indeterminate"; out["indeterminate_reason"] = "data_quality"
+        out["required_statement"]["units"] = [_unit(20, "R-DATA-QUALITY",
+            "行情数据存在空日期或全部价格为空的记录，无法判定。请重新拉取数据后重试。")]
+        return _finalize(out)
+    # 🔴 静默丢弃不可接受：若价格列有非空却被 coerce 成 NaN 的记录 → 报数据质量问题。
+    #    （对抗性审查：'abc' 被 coerce 成 NaN 后直接丢行，判定照跑，用户无感。）
+    _bad_px = daily[["open", "high", "low", "close"]].isna().any(axis=1).sum()
+    if _bad_px > 0:
+        out["status"] = "indeterminate"; out["indeterminate_reason"] = "data_quality"
+        out["required_statement"]["units"] = [_unit(20, "R-DATA-QUALITY",
+            "行情数据中有 %d 条记录的价格无法解析，无法判定。请重新拉取数据后重试。" % int(_bad_px))]
+        return _finalize(out)
+    daily = daily.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
+    if len(daily) < 30:
+        out["status"] = "indeterminate"; out["indeterminate_reason"] = "insufficient_history"
+        out["required_statement"]["units"] = [_unit(20, "R-INSUFFICIENT",
+            "有效行情数据不足（少于 30 个交易日），无法判定。")]
+        return _finalize(out)
 
     # ---- 输入契约防呆（对抗性审查建议，2026-10-26）----
     # 🔴 judge.py 的输入契约是「open/high/low/close 已是前复权价」。
@@ -841,9 +876,20 @@ def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None):
             "注意：数据截至 %s，距今天已 %d 天，行情可能已变化。" % (trade_date.strftime("%Y-%m-%d"), _days)))
 
     # ---- SA-06 金融 / SA-04 次新 ----
+    # 🔴 2026-10-26 导师复签 F-1：名单文件缺失时原先静默放行（平安会被当普通股判），
+    #    与 C2 那个 P0 同型。现改为：名单不可用 → 拒判并明示「金融属性未校验」，
+    #    宁可这一次不给判定，也不给出方法论禁止的结论。
     _fin_hit = _is_finance_symbol(code, market)
     if industry and any(k in str(industry) for k in FINANCE_KEYWORDS):
         _fin_hit = True
+    if not _fin_hit and not industry and not _FIN_OK:
+        out["status"] = "indeterminate"
+        out["indeterminate_reason"] = "finance_unverified"
+        out["required_statement"]["units"].append(_unit(20, "R-FINANCE-UNVERIFIED",
+            "本地的行业名单文件缺失，无法确认该股是否属于金融类（金融类按方法论不参与判定），"
+            "因此本次不做判定。请运行 --auto-update 补齐文件后重试；"
+            "在确认之前，请不要用其它方式推断该股的金融属性。"))
+        return _finalize(out)
     if _fin_hit:
         out["status"] = "indeterminate"; out["indeterminate_reason"] = "finance_industry"
         _ind_txt = ("该股属于%s。" % industry) if industry else "该股属于金融行业。"
@@ -867,8 +913,8 @@ def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None):
         #    数据停在 2025-01 时说"本月尚未收完"，而"本月"是 640 天前的月份。
         #    陈旧(stale)或回放(as_of)时一律改成「截至 X」的过去时表述。
         _past = bool(out["data_snapshot"].get("is_stale")) or bool(as_of)
-        _mw = ("所问的 %s 这个月" % as_of) if as_of else (
-              ("数据截至的 %s 这个月" % trade_date.strftime("%Y-%m-%d")) if _past else "本月")
+        _mw = ("所问的 %s 所在月" % as_of) if as_of else (
+              ("数据截至 %s 所在月" % trade_date.strftime("%Y-%m-%d")) if _past else "本月")
         _tail = ("该月要等收完才说。" if _past else "本月要等收完才说。")
         out["required_statement"]["units"].append(_unit(7, "R-MONTH-OPEN",
             "%s尚未收完，按 HOLDLE 方法论不做判定。截至 %s 的结论是：%s；%s"
@@ -894,7 +940,8 @@ def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None):
         label = "绿转红" if w["event"] == "lv_zhuan_hong" else "矮转高"
         if w["alive"]["is_alive"]:
             out["required_statement"]["units"].append(_unit(25, "R-WINDOW-OPEN",
-                "%s 出现%s开窗，该窗口目前仍存活。" % (w["event_month"], label)))
+                "%s 出现%s开窗，该窗口%s仍存活。"
+                % (w["event_month"], label, "当时" if as_of else "目前")))
         else:
             cr = w["alive"].get("close_reason") or ""
             out["required_statement"]["units"].append(_unit(25, "R-WINDOW-CLOSED",

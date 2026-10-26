@@ -59,7 +59,7 @@ except ImportError:
     ak = None
 
 # ── 版本与更新（2026-08-19 新增自更新机制，2026-08-25 安全加固） ──────
-VERSION = "1.0.9"                      # skill 包版本（与 version.json 对齐）
+VERSION = "1.0.10"                      # skill 包版本（与 version.json 对齐）
 
 # 🔴 v1.0.8（2026-10-26）：自更新从「只更新自己」扩展为「更新自己 + 附属模块」。
 #   背景：judge.py（判定模块）是 v1.0.8 新增的附属文件，只更新 holdle_data.py 会导致
@@ -251,12 +251,16 @@ def _auto_update(new_ver, restart=True):
         # 任一附属模块下载失败只告警，不阻断主脚本更新（主功能优先）
         _base_dir = os.path.dirname(self_path)
         _side_ok, _side_fail = [], []
+        _staged = []          # 先在内存里全部下齐+校验，最后统一落盘
         for _mod in SIDE_MODULES:
+            # 🔴 2026-10-26 对抗性审查 critical：_fname 原在"下载失败"分支之后才赋值，
+            #    一旦任一源失败就 NameError → 被外层 except 兜住 → 主脚本已写盘、附属模块一个没写，
+            #    用户被留在「半装状态」，还被告知"更新失败请手动 git pull"（误导）。
+            _fname, _kind = (_mod.split(":", 1) + ["py"])[:2]
             _mcontent = None
-            _remote_name = _mod.split(":", 1)[0]
-            for _u in (f"https://api.github.com/repos/emilesu/holdle-data-skill/contents/{_remote_name}",
-                       f"https://cdn.jsdelivr.net/gh/emilesu/holdle-data-skill@master/{_remote_name}",
-                       f"https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/{_remote_name}"):
+            for _u in (f"https://api.github.com/repos/emilesu/holdle-data-skill/contents/{_fname}",
+                       f"https://cdn.jsdelivr.net/gh/emilesu/holdle-data-skill@master/{_fname}",
+                       f"https://raw.githubusercontent.com/emilesu/holdle-data-skill/master/{_fname}"):
                 try:
                     _rq = _urlreq.Request(_u, headers={"User-Agent": "holdle-data/1.0"})
                     with _urlreq.urlopen(_rq, timeout=15) as _rs:
@@ -270,41 +274,53 @@ def _auto_update(new_ver, restart=True):
                 except Exception:
                     continue
             if not _mcontent:
-                _side_fail.append(_fname)
+                _side_fail.append(_fname + "(下载失败)")
                 continue
             # 安全检查：按类型校验内容（防止投毒下发任意文件）
-            _fname, _kind = (_mod.split(":", 1) + ["py"])[:2]
             _mtxt = _mcontent.decode("utf-8", errors="ignore")
             if _kind == "json":
-                # JSON 数据文件：必须可解析，且含预期结构标记
                 try:
                     _mj = _json.loads(_mtxt)
                 except Exception:
                     _side_fail.append(_fname + "(JSON 解析失败)")
                     continue
                 if _fname.startswith("trading_calendar"):
-                    _ok = ("months" in _mj) and isinstance(_mj.get("months"), dict)
+                    _valid = ("months" in _mj) and isinstance(_mj.get("months"), dict) and _mj.get("months")
                 elif _fname.startswith("finance_symbols"):
-                    _ok = ("symbols" in _mj) and isinstance(_mj.get("symbols"), dict)
+                    _valid = ("symbols" in _mj) and isinstance(_mj.get("symbols"), dict)
                 else:
-                    _ok = False
-                if not _ok:
+                    _valid = False
+                if not _valid:
                     _side_fail.append(_fname + "(结构校验失败)")
                     continue
             else:
                 if "HOLDLE 判定模块 judge.py" not in _mtxt or "def judge(" not in _mtxt:
                     _side_fail.append(_fname + "(内容校验失败)")
                     continue
-            try:
-                with open(os.path.join(_base_dir, _fname), "wb") as _mf:
-                    _mf.write(_mcontent)
-                _side_ok.append(_fname)
-            except Exception as _me:
-                _side_fail.append(f"{_mod}(写入失败:{_me})")
+            _staged.append((_fname, _mcontent))
+
+        # 🔴 要么全写、要么不写：核心判定模块缺一个，判定能力就是残缺的。
+        #    （日历缺 → 全部判「未收完」；金融名单缺 → 金融股被放行判定）
+        _registered = [m.split(":", 1)[0] for m in SIDE_MODULES]
+        _staged_names = {n for n, _ in _staged}
+        _miss_core = sorted(set(_registered) - _staged_names)
+        if _miss_core:
+            print(f"  ⚠️ 附属模块未下齐（缺: {', '.join(_miss_core)}），本次不写入半套文件，判定功能保持旧状态")
+            _staged = []
+        else:
+            for _fname, _mcontent in _staged:
+                try:
+                    _tmp = os.path.join(_base_dir, _fname + ".new")
+                    with open(_tmp, "wb") as _mf:
+                        _mf.write(_mcontent)
+                    os.replace(_tmp, os.path.join(_base_dir, _fname))   # 原子替换
+                    _side_ok.append(_fname)
+                except Exception as _me:
+                    _side_fail.append(f"{_fname}(写入失败:{_me})")
         if _side_ok:
             print(f"  ✅ 附属模块已更新: {', '.join(_side_ok)}")
         if _side_fail:
-            print(f"  ⚠️ 附属模块未能更新: {', '.join(_side_fail)}（判定功能暂不可用，数据拉取不受影响）")
+            print(f"  ⚠️ 附属模块未能更新: {', '.join(_side_fail)}（数据拉取不受影响；判定可能不可用）")
 
         print(f"  ✅ 已更新到 v{new_ver}（旧版备份: {os.path.basename(backup)}）")
         if restart:
