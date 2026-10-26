@@ -9,7 +9,7 @@ HOLDLE 行情数据获取脚本（用户版 v0.4）
 - ⚠️ 不含任何 HOLDLE 方法论判断（状态A/开窗/优先级等判断由你的 AI 助手完成）
 
 数据逻辑以 HOLDLE 最新导出脚本 export_data（2026-08 版）为准：
-  月K/周K/日K → TickFlow 主用（后复权，A/港/美三市场）→ 失败自动降级 Baostock（A股）
+  月K/周K/日K → datasource.py（新浪A股 / Yahoo 港美股，原始价+复权因子现算，全量）
   实时行情 → 腾讯（A股/港股）/ 新浪（美股）
   财报 → AkShare 东方财富（A股，近20年）
 
@@ -27,7 +27,7 @@ HOLDLE 行情数据获取脚本（用户版 v0.4）
   港股：hk_ 前缀（hk_00700）
 
 依赖安装：
-  pip3 install baostock tickflow akshare pandas
+  pip3 install pandas numpy requests pyarrow akshare
 
 数据源（全部公开免费，无需任何 token/key）：
   TickFlow Free（三市场 K 线）· Baostock（A股降级）· AkShare（财报）· 腾讯/新浪（实时）
@@ -55,21 +55,15 @@ except Exception as _e:  # noqa: BLE001
     _ds_to_bars = None
     _DS_IMPORT_ERROR = _e
 
+# 🔴 2026-10-26 换源：baostock / tickflow 已不再使用（K线统一走 datasource），
+#    这两个 import 一并移除，避免用户误以为还需要安装。
 try:
-    import baostock as bs
-except ImportError:
-    bs = None
-try:
-    from tickflow import TickFlow
-except ImportError:
-    TickFlow = None
-try:
-    import akshare as ak
+    import akshare as ak          # 财务数据（可选：未装时跳过财报，不影响K线与判定）
 except ImportError:
     ak = None
 
 # ── 版本与更新（2026-08-19 新增自更新机制，2026-08-25 安全加固） ──────
-VERSION = "1.1.2"                      # skill 包版本（与 version.json 对齐）
+VERSION = "1.1.3"                      # skill 包版本（与 version.json 对齐）
 
 # 🔴 v1.0.8（2026-10-26）：自更新从「只更新自己」扩展为「更新自己 + 附属模块」。
 #   背景：judge.py（判定模块）是 v1.0.8 新增的附属文件，只更新 holdle_data.py 会导致
@@ -105,8 +99,9 @@ FIN_YEARS = 20  # 财报取近20年（与内部生产脚本 holdle_stock_data.py
 
 # 复权模式映射（2026-08-19 老板定稿）
 ADJUST_MAP = {
-    "backward": {"tickflow": "backward", "baostock": "1", "label": "后复权"},
-    "forward":  {"tickflow": "forward",  "baostock": "2", "label": "前复权"},
+    # 🔴 2026-10-26 换源后只保留 label：取数统一走 datasource（adjust 直接传 forward/backward）
+    "backward": {"label": "后复权"},
+    "forward":  {"label": "前复权"},
 }
 DEFAULT_ADJUST = "backward"
 
@@ -819,7 +814,7 @@ def _lookup_industry(code, market='a'):
 
 
 # ═══════════════════════════════════════════════════
-#  主流程（TickFlow 主用 → Baostock 降级）
+#  主流程（datasource 统一取数 → judge 判定）
 # ═══════════════════════════════════════════════════
 def main():
     if len(sys.argv) < 2:
@@ -876,8 +871,6 @@ def main():
 
     adj = ADJUST_MAP[adjust]
     adj_label = adj["label"]
-    adj_bs = adj["baostock"]
-    adj_tf = adj["tickflow"]
 
     now = datetime.now()
     market_label = {'a': 'A股', 'us': '美股', 'hk': '港股'}.get(market, '未知')
@@ -886,7 +879,7 @@ def main():
     print(f"HOLDLE 行情数据获取（用户版 v0.4）")
     print(f"标的: {code}（{market_label}）  |  {now.strftime('%Y-%m-%d %H:%M')}")
     print(f"复权口径: {adj_label}（{adjust}）")
-    print(f"数据源: TickFlow 主用（月/周/日）→ Baostock 降级 → 新浪兜底（支持北交所）· AkShare 财报/资产负债表 · 腾讯/新浪 实时")
+    print("数据源: 新浪（A股）/ Yahoo（港美股）原始价 + 复权因子现算 · AkShare 财报 · 腾讯/新浪 实时")
     print(f"输出目录: {out_dir}")
     print("=" * 70)
 

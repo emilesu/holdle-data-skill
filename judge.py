@@ -617,8 +617,25 @@ def _build_state_a(latest, month_closed):
     return sa
 
 
+def _emit_finance_unchecked(out):
+    """把「未做金融校验」告警挂到输出上（延迟到 _finalize 统一追加）。
+
+    🔴 2026-10-26 对抗性审查 CRITICAL：原先加在判定主流程中段，
+       而「本月未收完」等早退分支在它**之前**就 return 了 →
+       真实场景（10月未收完）永远走不到 → 告警只在 stdout，模型念不到。
+       改为在 _finalize 统一追加，保证任何分支（含所有早退）都带上。
+    """
+    out["_finance_unchecked"] = True
+
+
 def _finalize(out):
     rs = out["required_statement"]
+    # 未做金融校验的告警：无论走哪个分支都必须出现在 final_text 里
+    if out.pop("_finance_unchecked", False):
+        if not any(u.get("code") == "R-FINANCE-UNCHECKED" for u in rs["units"]):
+            rs["units"].append({"seq": 15, "code": "R-FINANCE-UNCHECKED",
+                "text": "注意：本次未能核验该股的金融属性（金融类按 HOLDLE 方法论不参与状态A判定），"
+                        "以下结论对银行/保险/证券等金融股可能不适用；若该股属于金融行业，请以不判定为准。"})
     rs["units"] = sorted(rs["units"], key=lambda u: u["seq"])
     rs["final_text"] = "".join(u["text"] for u in rs["units"])
     rs["forbidden_additions"] = ["任何过渡句、建议句、鼓励句"]
@@ -803,9 +820,7 @@ def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None,
     #    关键：告警**必须进 final_text** —— SKILL.md 规定模型只能转述 final_text，
     #    只打 stdout 的话模型永远念不到，用户会拿到一份"对金融股可能不适用"却毫不知情的结论。
     if not finance_checked:
-        out["required_statement"]["units"].append(_unit(15, "R-FINANCE-UNCHECKED",
-            "注意：本次未能核验该股的金融属性（金融类按 HOLDLE 方法论不参与状态A判定），"
-            "以下结论对银行/保险/证券等金融股可能不适用；若该股属于金融行业，请以不判定为准。"))
+        _emit_finance_unchecked(out)
     if industry and any(k in str(industry) for k in FINANCE_KEYWORDS):
         out["status"] = "indeterminate"; out["indeterminate_reason"] = "finance_industry"
         _ind_txt = ("该股属于%s。" % industry) if industry else "该股属于金融行业。"

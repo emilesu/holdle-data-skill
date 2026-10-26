@@ -461,3 +461,45 @@ class TestMentorRecheckSuggestions:
                 txt = r["required_statement"]["final_text"]
                 assert "目前仍存活" not in txt, "%s 回放仍用「目前」，应改「当时」" % a
         assert hit > 0, "无窗口存活场景，本测试空转"
+
+
+# ── 9. 核心公式数值锁定（2026-10-26 代码审查 H-3 / M-1）──────────────
+# 🔴 由来：审查员把 E-02 参考价从 max(high) 改成 min(low)，
+#    600743@2026-09-30 的参考价从 2.47 变 2.08（正是历史出过 16% 偏差那处），
+#    而 68 个测试全绿——因为测试几乎全是"结构性断言"（entry is None / 不得出现某词），
+#    拦不住「算错了但形状完全正常」。
+#    这里给核心公式上**数值锁**：算出来必须等于这个数，差 1e-6 都算错。
+class TestNumericLocks:
+    def test_e02_ref_price_exact_value(self):
+        """🔴 E-02 参考价数值锁 = max(high[开窗月首日 .. 绿柱日])（闭区间，不看柱色）。
+
+        数据固化为 tests/fixtures/300308_e02_case.csv（3286 行，截到 2026-06-30），
+        真值 917.4875 由知识库 judge_service 独立复算确认。
+        用固定 fixture 而非实时缓存：实时数据会随数据源刷新而变，锁不住。
+
+        变异验证：把 `["high"].max()` 改成 `["low"].min()`，本用例必红。
+        """
+        fp = os.path.join(ROOT, "tests", "fixtures", "300308_e02_case.csv")
+        if not os.path.exists(fp):
+            pytest.skip("缺 E-02 fixture")
+        d = pd.read_csv(fp, parse_dates=["date"])
+        r = judge.judge(d, code="300308", finance_checked=True)
+        en = r.get("entry") or {}
+        assert en.get("ref_price") is not None, "fixture 未走到 E-02 计算，测试失去保护意义"
+        got = float(en["ref_price"])
+        assert abs(got - 917.4875) < 0.01, (
+            "E-02 参考价数值错误：期望 917.4875，实际 %.4f（公式被改坏？应 max(high[..])）" % got)
+        assert "max(high[" in (en.get("ref_price_formula") or ""), (
+            "E-02 公式字符串异常：%r" % en.get("ref_price_formula"))
+
+    def test_sticky_ratio_threshold_locked(self):
+        """贴0轴阈值必须锁死 0.03（2026-10-18 拍板主口径）。"""
+        assert judge.REL_STICKY_RATIO == 0.03
+
+    def test_miss5_locked(self):
+        """E-06 不追 5% 必须锁死。"""
+        assert judge.MISS5_PCT == 0.05
+
+    def test_macd_params_locked(self):
+        """SA-02 MACD 参数 12/26/9 不可调。"""
+        assert (judge.FAST, judge.SLOW, judge.SIG) == (12, 26, 9)

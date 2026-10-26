@@ -1,4 +1,12 @@
-baostock
-tickflow
-akshare
+# HOLDLE 数据脚本依赖（2026-10-26 换源后更新）
+#
+# K线取数（datasource.py）：新浪(A股) / Yahoo(港美股) 原始价 + 复权因子现算
 pandas
+numpy
+requests
+pyarrow
+#
+# 财务数据（可选）：未装时只跳过财报，不影响 K线与判定
+#   A股   stock_financial_abstract
+#   港股/美股 对应公司资料接口
+akshare
