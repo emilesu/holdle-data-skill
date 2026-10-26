@@ -39,7 +39,6 @@ warnings.filterwarnings('ignore')
 import os
 import re
 import sys
-import time
 import urllib.request as urlreq
 from datetime import datetime
 
@@ -70,7 +69,7 @@ except ImportError:
     ak = None
 
 # ── 版本与更新（2026-08-19 新增自更新机制，2026-08-25 安全加固） ──────
-VERSION = "1.1.0"                      # skill 包版本（与 version.json 对齐）
+VERSION = "1.1.1"                      # skill 包版本（与 version.json 对齐）
 
 # 🔴 v1.0.8（2026-10-26）：自更新从「只更新自己」扩展为「更新自己 + 附属模块」。
 #   背景：judge.py（判定模块）是 v1.0.8 新增的附属文件，只更新 holdle_data.py 会导致
@@ -634,6 +633,17 @@ def fetch_financials_a_ths(code):
     return result
 
 
+def _is_bj(code):
+    """北交所代码：4/8 开头，以及 920 新段。
+
+    🔴 2026-10-26 代码审查 C-1：换源删旧数据线时，本函数被连带删除，
+       但 `_a_em_prefix` 仍在调用 → NameError → 被 fetch_financials_a 的
+       `except Exception: pass` 吞掉 → 所有非 6 开头 A 股（占一半以上）
+       的「现金占总资产(%)」字段永久为空，而这是企业质量门槛要用的字段。
+    """
+    return str(code).startswith(('4', '8', '92'))
+
+
 def _a_em_prefix(code):
     """东方财富代码前缀：6→SH(沪)、0/3→SZ(深)、北交所(4/8/92)→BJ"""
     if code.startswith('6'):
@@ -735,18 +745,6 @@ def fetch_financials_a(code):
         except Exception:
             return []
 
-
-# ═══════════════════════════════════════════════════
-#  MACD 计算（标准公开公式 12/26/9）
-# ═══════════════════════════════════════════════════
-def calc_macd(df, fast=12, slow=26, signal=9):
-    """输入含 close 列的 DataFrame，返回 (DIF, DEA, MACD柱)。标准公开公式，无方法论含量。"""
-    ema_fast = df['close'].ewm(span=fast, adjust=False).mean()
-    ema_slow = df['close'].ewm(span=slow, adjust=False).mean()
-    dif = ema_fast - ema_slow
-    dea = dif.ewm(span=signal, adjust=False).mean()
-    macd = (dif - dea) * 2
-    return dif, dea, macd
 
 
 # ═══════════════════════════════════════════════════

@@ -9,12 +9,25 @@
         （该文件由老板 2026-10-25 拍板、经过三步验证：
           K线三市场实时性 ✅ / 复权计算逐位一致（差 0.00000000）✅ / 财务口径 8/8 一致 ✅）
 
-   移植原则（同 judge.py）：**只做机械替换，不改判定与取数逻辑**。
-     ① 缓存根：工作区固定路径 → 用户目录（可用 HOLDLE_AI_CACHE 覆盖）
-     ② print 调试输出 → 静默（用户端不该看到内部日志）
+   移植改动清单（**如实 5 条**，2026-10-26 代码审查指出原先只声明了 2 条、与事实不符）：
+     ① 缓存根：工作区固定路径 → 用户目录（`~/.holdle_ai_cache`，可用 HOLDLE_AI_CACHE 覆盖）
+        · 验证：取数后检查缓存文件是否落在该目录
+     ② 调试 print 全部移除（用户端不该看到内部日志）
+        · 验证：跑一次取数，终端除主流程输出外无额外行
+     ③ ⚠️ **结构调整（非机械替换）**：复权因子 factors 的读写
+        原：load_daily 内单独调用 pd.read_parquet / to_parquet
+        现：_read_cache / _write_cache 一次性返回/接收三元组 (daily, meta, factors)
+        · 理由：避免 load_daily 里对同一目录反复拼路径
+        · 验证：三市场取数后，qfq_* 列与知识库逐位一致（实测差 0.000000000000）
+     ④ ⚠️ **新增**：写缓存包 try/except（缓存写失败不影响本次取数结果）
+        · 验证：缓存目录不可写时仍能取到数据
+     ⑤ ⚠️ **新增**：缓存目录建不出来时降级为「不缓存、照常联网」
+        （原实现会在任何网络请求前抛 PermissionError，直接崩溃）
+        · 验证：HOLDLE_AI_CACHE 指向不可写路径，仍能取数
 
-   本模块取代了 holdle_data.py 原先的 TickFlow / Baostock / 同花顺 / 东财 四条数据线，
-   全产品**只保留这一套取数方式**（老板 2026-10-26 确认：不需要两套）。
+   ⚠️ 其中 ③④⑤ 不是"机械替换"。下次维护者改这里时，**别以为是安全的一字不改**，
+      改完必须重跑「与知识库 data_source.py 的复权逐位比对」+ 三市场取数。
+
 ════════════════════════════════════════════════════════════════
 
 取数方式（老板 2026-10-25 拍板，见 data_source.py 头部与日记）：
@@ -44,6 +57,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -106,15 +120,41 @@ class FetchMeta:
 
 # ---------- 缓存 ----------
 
+# 缓存目录是否可用（建不出来 → 走纯网络路径，不崩）
+_CACHE_USABLE = None
+
+
 def _cache_paths(symbol: str):
+    """→ 三个缓存文件路径；缓存目录不可用时返回 (None, None, None)。
+
+    🔴 2026-10-26 代码审查 high：原实现在这里直接 `d.mkdir(parents=True)`，
+       而它发生在**任何网络请求之前** → 家目录只读/磁盘满/被杀软锁/企业受限环境时，
+       load_daily 直接抛 PermissionError（不是 DataUnavailable），整个取数崩溃。
+       用户端环境参差（Windows 杀软、企业域控、容器只读挂载都很常见），
+       正确行为是「缓存不可用 → 照常联网拉，只是不缓存」。
+    """
+    global _CACHE_USABLE
+    if _CACHE_USABLE is False:
+        return None, None, None
     safe = symbol.replace(".", "_")
-    d = CACHE_ROOT / "daily"
-    d.mkdir(parents=True, exist_ok=True)
+    try:
+        d = CACHE_ROOT / "daily"
+        d.mkdir(parents=True, exist_ok=True)
+        # 真正写一次探针，确认可写（mkdir 成功不等于可写）
+        _probe = d / ".write_probe"
+        _probe.write_text("ok", encoding="utf-8")
+        _probe.unlink(missing_ok=True)
+        _CACHE_USABLE = True
+    except Exception:
+        _CACHE_USABLE = False
+        return None, None, None
     return d / f"{safe}.parquet", d / f"{safe}.meta.json", d / f"{safe}.factors.parquet"
 
 
 def _read_cache(symbol: str):
     dp, mp, fp = _cache_paths(symbol)
+    if dp is None or mp is None:
+        return None, None, None          # 缓存不可用 → 走纯网络
     if not dp.exists() or not mp.exists():
         return None, None, None
     try:
@@ -126,6 +166,8 @@ def _read_cache(symbol: str):
 
 def _write_cache(symbol: str, df, meta: dict, factors=None):
     dp, mp, fp = _cache_paths(symbol)
+    if dp is None:
+        return                            # 缓存不可用 → 静默跳过（不影响本次结果）
     df.to_parquet(dp, index=False)
     mp.write_text(json.dumps(meta, ensure_ascii=False, indent=1))
     if factors is not None and not factors.empty:
@@ -212,8 +254,15 @@ def _fetch_a_share(symbol: str) -> tuple[pd.DataFrame, pd.DataFrame]:
             for item in payload.get("data", []):
                 d = item.get("d") or item.get("date")
                 f = item.get("f") or item.get("factor")
+                # 🔴 C-2 同源修复：字符串 "0" 是 truthy，会通过 `if d and f` → float("0")=0.0
+                #    因此必须显式校验因子 > 0 且有限，非法值直接丢弃并计数。
                 if d and f:
-                    recs.append({"kind": kind, "date": pd.to_datetime(d), "factor": float(f)})
+                    try:
+                        _fv = float(f)
+                    except (TypeError, ValueError):
+                        continue
+                    if _fv > 0 and np.isfinite(_fv):
+                        recs.append({"kind": kind, "date": pd.to_datetime(d), "factor": _fv})
         except DataUnavailable:
             raise
         except Exception as e:
@@ -306,9 +355,16 @@ def _to_qfq(daily: pd.DataFrame, factors: pd.DataFrame, adjust: str = "forward")
     out = daily.copy()
     for c in ("open", "high", "low", "close"):
         out[f"qfq_{c}"] = out[c] / fac
-    bad = out["qfq_close"] <= 0
+    # 🔴 2026-10-26 代码审查 C-2：因子本身可能是脏值（factor=0 → qfq=inf；factor=NaN → qfq=nan）。
+    #    原实现只查 `qfq_close <= 0`，inf/nan 都能漏过 → 脏数据一路喂进判定，
+    #    judge 仍给出「该股不处于状态A」这种**确定的错结论**（实测 98% 的行是 inf）。
+    #    现在：出现非有限值/非正值一律**拒绝判定**，绝不带着脏数据往下走。
+    _px = out["qfq_close"].to_numpy(dtype="float64")
+    bad = ~np.isfinite(_px) | (_px <= 0)
     if bad.any():
-        out.loc[bad, ["qfq_close", "qfq_open", "qfq_high", "qfq_low"]] = float("nan")
+        raise DataUnavailable(
+            "复权价出现非有限值或非正值（%d/%d 行，疑似复权因子异常），"
+            "拒绝以脏数据判定。请重试；若持续出现请反馈给 HOLDLE。" % (int(bad.sum()), len(_px)))
     return out
 
 
