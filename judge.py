@@ -702,8 +702,14 @@ def _finalize(out):
     rs["forbidden_additions"] = ["任何过渡句、建议句、鼓励句"]
     rs["fallback_unknown"] = ("这个问题超出了当前判定能给出的范围，我不做推测。"
                               "你可以问我这只股票的状态A、开窗事件、入场参考价或出场参考。")
-    # H4：免责段恒在末尾，不经模型、不可省略
+    # H4：免责段恒在末尾。🔴 2026-10-26 对抗性审查：原只放 JSON 字段，
+    #    而 SKILL.md 规定「只能转述 final_text」→ 模型照规矩做就永远念不到免责段。
+    #    现同时作为 seq=99 话术单元进入 final_text，并保留字段供结构化消费。
     out["disclaimer"] = DISCLAIMER
+    if not any(u.get("code") == "R-DISCLAIMER" for u in rs["units"]):
+        rs["units"].append({"seq": 99, "code": "R-DISCLAIMER", "text": DISCLAIMER})
+        rs["units"] = sorted(rs["units"], key=lambda u: u["seq"])
+        rs["final_text"] = "".join(u["text"] for u in rs["units"])
     return out
 
 
@@ -788,10 +794,19 @@ def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None):
             "as_of": as_of, "adjust": "forward", "source": "holdle-data-skill",
             "is_stale": False, "calendar_covered_through": None,
         }
-        out["required_statement"]["units"].append(_unit(20, "R-CALENDAR-STALE",
-            "本地的交易日历没有覆盖到该股最新的月份，无法判断这个月是否已经收完，"
-            "因此本次不做判定。请更新数据脚本（运行 --auto-update）后重试；"
-            "在拿到判定之前，请不要用其它方式推断结论。"))
+        # 两种故障要分开说，否则会把人引错方向（对抗性审查建议）
+        _cal = _load_month_calendar() or {}
+        if not _cal:
+            _msg = ("本地的交易日历文件缺失（可能未下载完整），无法判断该月是否收完，"
+                    "因此本次不做判定。请重新安装或运行 --auto-update 补齐文件；"
+                    "在拿到判定之前，请不要用其它方式推断结论。")
+        else:
+            _ms = (_cal.get("us" if market == "us" else ("hk" if market == "hk" else "cn")) or {})
+            _cover = max(_ms.keys()) if _ms else "未知"
+            _msg = ("本地交易日历只覆盖到 %s，没有该股最新的月份，无法判断该月是否收完，"
+                    "因此本次不做判定。请运行 --auto-update 更新日历；"
+                    "在拿到判定之前，请不要用其它方式推断结论。" % _cover)
+        out["required_statement"]["units"].append(_unit(20, "R-CALENDAR-STALE", _msg))
         return _finalize(out)
 
     lag = int((pd.Timestamp.now().normalize() - pd.Timestamp(as_of).normalize()).days) if as_of else 0
@@ -848,9 +863,16 @@ def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None):
 
     if not month_closed:
         prev = monthly.iloc[-2]
+        # 🔴 2026-10-26 对抗性审查：陈旧/回放时说「本月」会错乱——
+        #    数据停在 2025-01 时说"本月尚未收完"，而"本月"是 640 天前的月份。
+        #    陈旧(stale)或回放(as_of)时一律改成「截至 X」的过去时表述。
+        _past = bool(out["data_snapshot"].get("is_stale")) or bool(as_of)
+        _mw = ("所问的 %s 这个月" % as_of) if as_of else (
+              ("数据截至的 %s 这个月" % trade_date.strftime("%Y-%m-%d")) if _past else "本月")
+        _tail = ("该月要等收完才说。" if _past else "本月要等收完才说。")
         out["required_statement"]["units"].append(_unit(7, "R-MONTH-OPEN",
-            "本月尚未收完，按 HOLDLE 方法论不做判定。截至 %s 的结论是：%s；本月要等收完才说。"
-            % (last_closed, "状态A成立" if bool(prev["state_a"]) else "状态A不成立")))
+            "%s尚未收完，按 HOLDLE 方法论不做判定。截至 %s 的结论是：%s；%s"
+            % (_mw, last_closed, "状态A成立" if bool(prev["state_a"]) else "状态A不成立", _tail)))
         return _finalize(out)
 
     if sz["evaluated"] is False and sz["reason"] == "dea_near_zero":
