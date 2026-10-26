@@ -1,5 +1,5 @@
 {
-  "version": "1.1.5",
-  "changelog": "v1.1.5：【修复·同一 bug 第三次复发，改为单一判据】金融状态原先由两个来源判断（finance_checked 布尔 + finance_status 字符串），写成 if/elif 后隐含\"互斥\"假设 → nodep 时\"未校验\"告警被短路（前两版分别是：告警挂在早退分支之后、上游传参把 nodep 算成已校验）。现收敛为**基于 finance_status 的单一三选一判定**，不再依赖布尔：empty→拒判 / nodep,error→照常判+告警 / found→不额外加东西。并新增 TestFinanceStatusMatrix 6 例锁死互斥性（任一 status 下两个金融单元不得同时出现）。同时修正北交所误伤：停牌日原始价为 0 属正常占位（430047.BJ 实测 5 行），原被误报「疑似复权因子异常」而拒判；现区分「原始价0→置NaN继续」与「因子脏→拒判」。",
+  "version": "1.1.6",
+  "changelog": "v1.1.6：【工程收口】①check_release.py 新增静态检查（ruff F821/F401/F841），阻断「删函数没删调用」这类错误——它本版已发生三次（_is_bj / _emit_finance_unchecked 等），且不会在测试里暴露（被 except 吞掉或被提前 return 跳过），但一查就出来。②清理连挂六版的遗留：judge.py 未使用的 import os、未使用变量 last_closed_pos；holdle_data.py 未使用的 daily。",
   "updated": "2026-10-26"
 }

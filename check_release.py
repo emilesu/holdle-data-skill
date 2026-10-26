@@ -14,6 +14,7 @@
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -71,6 +72,36 @@ def main():
             if not good:
                 ok = False
             print("  %s %-34s HTTP %s" % ("✅" if good else "❌", fname, code))
+
+    # ── 静态检查（2026-10-26 代码审查建议）──
+    # 🔴 由来：「删函数没删调用」已发生三次（_is_bj / _emit_finance_unchecked / …）。
+    #    这类错误不会在测试里暴露（被 except 吞掉或被提前 return 跳过），
+    #    但 F821（未定义名）一查就出来，成本 0 行新代码。
+    print("\n静态检查（ruff F821 未定义名 / F401 未用 import / F841 未用变量）：")
+    _files = [f for f in ("holdle_data.py", "datasource.py", "judge.py")
+              if os.path.exists(os.path.join(HERE, f))]
+    try:
+        _ruff = shutil.which("ruff")
+        if _ruff is None:
+            # 优先用项目 venv 里的 ruff
+            _cand = os.path.join(os.path.dirname(HERE), "..", ".venv", "bin", "ruff")
+            _cand = os.path.abspath(_cand)
+            _ruff = _cand if os.path.exists(_cand) else None
+        if _ruff:
+            _r = subprocess.run([_ruff, "check", "--select", "F821,F401,F841",
+                                 "--output-format=concise"] + _files,
+                                cwd=HERE, capture_output=True, text=True)
+            if _r.returncode == 0:
+                print("  ✅ 无未定义名 / 未用 import / 未用变量")
+            else:
+                ok = False
+                print("  ❌ 静态检查未通过：")
+                for _l in (_r.stdout or "").strip().splitlines()[:10]:
+                    print("     " + _l)
+        else:
+            print("  ⚠️ 未找到 ruff，跳过静态检查（建议 pip install ruff）")
+    except Exception as _e:      # noqa: BLE001
+        print("  ⚠️ 静态检查执行失败：%s" % str(_e)[:80])
 
     print("\n" + ("✅ 可以发版" if ok else "❌ 存在问题，禁止发版"))
     return 0 if ok else 1

@@ -35,7 +35,6 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime
 
 import numpy as np
@@ -212,7 +211,6 @@ def detect_windows(monthly: pd.DataFrame, sticky_mode: str = "rel",
     hist_above0_seen = False
     dif_above0_seen = False
     prev_h = None           # 前月柱（矮转高的局部比较基准）
-    last_closed_pos = None  # 上次关窗的月序（判"续命"标签）
     traded_ok = monthly["traded"].values if "traded" in monthly.columns else np.ones(len(monthly), dtype=bool)
     if close_rule not in ("base", "adjacent", "adjacent_traded"):
         raise ValueError(f"未知 close_rule={close_rule}（可选 base / adjacent / adjacent_traded）")
@@ -255,8 +253,6 @@ def detect_windows(monthly: pd.DataFrame, sticky_mode: str = "rel",
                                "open_month": w_["open_month"]})
             else:
                 still.append(w_)
-        if len(still) < len(windows):
-            last_closed_pos = i
         windows = still
 
         prev_traded_h = h     # 本月已判定完，作为下一个交易月的"上月柱"

@@ -63,7 +63,7 @@ except ImportError:
     ak = None
 
 # ── 版本与更新（2026-08-19 新增自更新机制，2026-08-25 安全加固） ──────
-VERSION = "1.1.5"                      # skill 包版本（与 version.json 对齐）
+VERSION = "1.1.6"                      # skill 包版本（与 version.json 对齐）
 
 # 🔴 v1.0.8（2026-10-26）：自更新从「只更新自己」扩展为「更新自己 + 附属模块」。
 #   背景：judge.py（判定模块）是 v1.0.8 新增的附属文件，只更新 holdle_data.py 会导致
@@ -970,8 +970,6 @@ def main():
         _show.columns = ["日期", "收盘", "DIF", "DEA", "柱"]
         print("\n=== 月K最近12根（含MACD指标）===")
         print(_show.to_string(index=False))
-    else:
-        daily = pd.DataFrame()
 
     # ── 判定（2026-10-26 新增）：状态A/开窗/入场参考价由脚本算，模型只转述 ──
     # 🔴 只在"现状判断"（前复权）时做判定：判定口径是前复权（裁决#1），
