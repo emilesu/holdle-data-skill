@@ -182,7 +182,7 @@ def _resample_monthly(daily):
 # ══ 以下三段：从知识库已验证实现机械移植（勿手改）══
 def detect_windows(monthly: pd.DataFrame, sticky_mode: str = "rel",
                    rel_ratio: float = REL_STICKY_RATIO,
-                   close_rule: str = "base") -> list[dict]:
+                   close_rule: str = "adjacent") -> list[dict]:
     """W 族开窗判定 v2（锚点修正后的正确语义，映射表 v1.2）。
 
     核心语义（源自 导师判断_2016续命窗口复核.md 逐句对齐）：
@@ -197,9 +197,15 @@ def detect_windows(monthly: pd.DataFrame, sticky_mode: str = "rel",
       新开窗前提 = 前窗已关闭（原文 §4.1 2026-09-14 三条件之一）。前窗未关时的矮转高
       记为 `window_suppressed`（诊断用），不产生事件。
     - 关闭通道（任一命中）：
-      C1 月K高转矮：默认 close_rule="base" → 本月柱 < 本窗基准柱（v2.11 基准月=开窗月，封版口径）；
-         close_rule="adjacent"        → 本月柱 < 上月柱（含停牌月的前值填充柱）——**口径变更对照档，非拍板口径**
-         close_rule="adjacent_traded" → 本月柱 < 上一个"有交易月"的柱（停牌月不参与比较）——同对照档
+      C1 月K高转矮（🔴 2026-10-26 老板确认的口径，见下）：
+         close_rule="adjacent"        → **本月柱 < 上月柱（含停牌月的前值填充柱）——这就是现行拍板口径**；
+                                        本模块实际调用即此值（judge() 内 close_rule="adjacent"）
+         close_rule="base"            → 本月柱 < 本窗基准柱（基准月=开窗月）——**旧口径，2026-10-19 已作废**，
+                                        仅保留用于历史数字复算，不得用于实际判定
+         close_rule="adjacent_traded" → 本月柱 < 上一个"有交易月"的柱（停牌月不参与比较）——对照档
+         ⚠️ 原注释把 base 写成"v2.11 封版口径"、adjacent 写成"对照档"，**说反了**。
+            老板 2026-10-19 拍板：原「基准月=开窗月」作废，改为「本月柱 < 上月柱」
+            （映射表 W-04 v1.7；起因：000002.SZ 2015-11 按旧口径仍未关窗）。
       C2 状态A失效：`not state_a`（双线任一<0 或 柱≤0 —— SA-01 三条件任一不满足）
       （注：原文 §7.2「50-60 天不突破→入场失效」按老板 2026-10-18 拍板视为上述两条的通俗表述，不单独实现）
       C3 日K突破超期（§7.2 50-60天）：日K层判定，月K层接口预留（本函数只出月K事件）
