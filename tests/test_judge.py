@@ -399,18 +399,26 @@ class TestMentorRecheckSuggestions:
         assert closed is False, "数据停在月中，本月不该判收完"
         assert last_closed == "2026-09", "最后已收完月应为上月，实际 %r" % last_closed
 
-    def test_finance_unverified_not_silent(self):
-        """🔴 行业没查到（akshare 未装/接口失败）时不得静默放行（C2 同型）。
+    def test_finance_unchecked_warns_in_final_text(self):
+        """🔴 导师终审 C-2 裁定：环境缺依赖（akshare 没装）≠ 无法确认是否金融。
 
-        三种语义必须分开：
-          · 查到金融      → 拒判
-          · 查到非金融    → 正常判
-          · 没查到        → 拒判（finance_unverified）
+        · 缺依赖 → **照常判定** + 告警**必须进 final_text**
+          （SKILL.md 规定模型只能转述 final_text，只打 stdout 等于没告警）
+        · 接口正常返回但字段为空（empty）→ 由 holdle_data 传 finance_checked=True
+          且 industry=None，走正常判定；真正的"无法确认"由调用方决定是否拒判
         """
         d = make_daily()
         r = judge.judge(d, code="601318", industry=None, finance_checked=False)
-        assert r["status"] == "indeterminate"
-        assert r["indeterminate_reason"] == "finance_unverified"
+        # 不再拒判（导师裁定：缺依赖不能废掉判定功能）
+        assert r["indeterminate_reason"] != "finance_unverified"
+        # 但告警必须出现在模型能念到的地方
+        assert "R-FINANCE-UNCHECKED" in [u["code"] for u in r["required_statement"]["units"]]
+        assert "未能核验该股的金融属性" in r["required_statement"]["final_text"]
+
+    def test_finance_unchecked_not_noisy_when_checked(self):
+        """反向断言：已做校验时不得乱贴告警（防"为了通过测试无条件加一句"）。"""
+        r = judge.judge(make_daily(), code="600519", industry="白酒", finance_checked=True)
+        assert "R-FINANCE-UNCHECKED" not in [u["code"] for u in r["required_statement"]["units"]]
 
     def test_finance_confirmed_non_finance_judges(self):
         """查到且确认非金融 → 正常判定（不能因为加了这个检查就把所有股票都拒判）。"""

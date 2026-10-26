@@ -69,7 +69,7 @@ except ImportError:
     ak = None
 
 # ── 版本与更新（2026-08-19 新增自更新机制，2026-08-25 安全加固） ──────
-VERSION = "1.1.1"                      # skill 包版本（与 version.json 对齐）
+VERSION = "1.1.2"                      # skill 包版本（与 version.json 对齐）
 
 # 🔴 v1.0.8（2026-10-26）：自更新从「只更新自己」扩展为「更新自己 + 附属模块」。
 #   背景：judge.py（判定模块）是 v1.0.8 新增的附属文件，只更新 holdle_data.py 会导致
@@ -750,47 +750,72 @@ def fetch_financials_a(code):
 # ═══════════════════════════════════════════════════
 #  行业查询（SA-06 金融类判定用，在线获取，不背静态名单）
 # ═══════════════════════════════════════════════════
+def _clean_industry(v):
+    """行业字段清洗：空值/垃圾值一律视为**没查到**。
+
+    🔴 2026-10-26 导师终审 C-2 + 对抗性审查同报：
+       原实现 A 股分支直接 `return str(...).strip(), True`，没有清洗 →
+       AkShare 返回 'nan'/'None'/''/'—' 时，会变成「查到了，行业叫 nan」，
+       词表匹配不到 → **静默按非金融放行** → 平安被判成普通股给出状态A结论。
+       这正是 v1.0.8 被大回的 P0 同型复发。
+    """
+    if v is None:
+        return None
+    s2 = str(v).strip()
+    if not s2 or s2.lower() in ('nan', 'none', 'null', '-', '--', 'n/a'):
+        return None
+    return s2
+
+
 def _lookup_industry(code, market='a'):
-    """查该股所属行业 → (industry 或 None, 是否真的查到了)。
+    """查该股所属行业 → (industry 或 None, 状态)。
 
-    🔴 2026-10-26：原先我用随包分发的 finance_symbols.json（底库静态名单），会过期。
-       改为在线查询（A股/港股/美股分别走 AkShare 对应接口）。
+    🔴 2026-10-26 修正（导师终审 C-2 + 对抗性审查）：返回值改成三态字符串，
+       因为原先的布尔「是否查到」把三件不同的事混成了一件：
 
-    🔴 返回值必须是二元组，因为两种 None 语义完全不同：
-       ("银行", True)  → 查到且是金融
-       ("软件服务", True) → 查到且非金融 → 正常判定
-       (None, False)   → **没查到** → 无法确认是否金融 → 按方法论不判（拒绝静默放行）
+       ('银行',  'found')     查到且是金融
+       ('软件',  'found')     查到且非金融 → 正常判定
+       (None,    'empty')     **查了，但接口正常返回、只是这只股行业字段是空的**
+                              → 无法确认 → 拒判（风险方向必须保守）
+       (None,    'nodep')     **环境缺依赖**（akshare 未安装）→ 不是"无法确认"，
+                              是"这次没做校验" → 照常判定 + 显式告警
+                              （知识库 judge_service 也是这么处理：读表失败=放行+告警）
+       (None,    'error')     查的过程中抛异常（网络/接口改版）→ 照常判定 + 告警
+
+       ⚠️ 'nodep' / 'error' 为什么不再拒判：
+          akshare 是**可选依赖**，用户没装是常态（要装十几个包）。
+          若因此对所有股票拒判，等于「判定功能 100% 不可用、取数却照常成功」，
+          用户会以为工具坏了。而金融股被误判的风险，由显式告警 + SKILL.md 说明来兜。
     """
     try:
         import akshare as ak
     except Exception:
-        return None, False
+        return None, 'nodep'          # 缺依赖 ≠ 无法确认
     try:
         if market == 'a':
             df = ak.stock_individual_info_em(symbol=code)
             if df is not None and not df.empty and 'item' in df.columns:
                 row = df[df['item'].astype(str).str.contains('行业', na=False)]
                 if not row.empty:
-                    return str(row.iloc[0]['value']).strip(), True
-        elif market == 'hk':
+                    v = _clean_industry(row.iloc[0]['value'])
+                    if v:
+                        return v, 'found'
+                    return None, 'empty'      # 字段在，但值是空/垃圾
+            return None, 'empty'
+        # 港股/美股
+        if market == 'hk':
             df = ak.stock_hk_company_profile_em(symbol=code)
-            if df is not None and not df.empty:
-                for col in ('所属行业', '行业', 'industry'):
-                    if col in df.columns:
-                        v = str(df.iloc[0][col]).strip()
-                        if v and v.lower() not in ('nan', 'none', ''):
-                            return v, True
         else:
             df = ak.stock_us_company_profile_em(symbol=code)
-            if df is not None and not df.empty:
-                for col in ('所属行业', '行业', 'industry'):
-                    if col in df.columns:
-                        v = str(df.iloc[0][col]).strip()
-                        if v and v.lower() not in ('nan', 'none', ''):
-                            return v, True
+        if df is not None and not df.empty:
+            for col in ('所属行业', '行业', 'industry'):
+                if col in df.columns:
+                    v = _clean_industry(df.iloc[0][col])
+                    if v:
+                        return v, 'found'
+        return None, 'empty'
     except Exception:
-        return None, False
-    return None, False
+        return None, 'error'
 
 
 # ═══════════════════════════════════════════════════
@@ -966,10 +991,16 @@ def main():
         try:
             import judge as _judge
             # 金融类(SA-06)行业：在线查询（查不到传 None → 按非金融正常判定）
-            _industry, _fin_checked = _lookup_industry(code, market)
+            _industry, _fin_st = _lookup_industry(code, market)
+            # found → 已确认（金融则拒判）；empty → 无法确认（拒判）；
+            # nodep/error → 未做校验（照常判定 + 告警，不因缺依赖废掉判定功能）
+            if _fin_st in ('nodep', 'error'):
+                print(f"  ⚠️ 本次未做金融类（SA-06）校验："
+                      f"{'akshare 未安装' if _fin_st == 'nodep' else '行业接口异常'}；"
+                      f"判定结果对金融股可能不适用（金融类按方法论不参与判定）。")
             _j = _judge.judge(daily_full, code=code, market=market,
                               stock_name=None, industry=_industry,
-                              finance_checked=_fin_checked)
+                              finance_checked=(_fin_st != 'empty'))
             _jpath = f"{out_dir}/{code}_判定.json"
             _judge.dump(_j, _jpath)
             print("\n" + "=" * 70)

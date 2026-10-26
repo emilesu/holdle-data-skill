@@ -160,7 +160,11 @@ def _read_cache(symbol: str):
     try:
         factors = pd.read_parquet(fp) if fp.exists() else None
         return pd.read_parquet(dp), json.loads(mp.read_text()), factors
-    except Exception:
+    except Exception as e:      # noqa: BLE001
+        # 🔴 2026-10-26 对抗性审查 M-2：缓存损坏原先完全静默（用户每次全量重拉，
+        #    且"缓存坏了"这个事实被掩盖）。现在留一条告警到 stderr，不影响取数。
+        import sys as _sys
+        _sys.stderr.write("[holdle] 缓存损坏，已改用网络重新拉取：%s（%s）\n" % (symbol, str(e)[:80]))
         return None, None, None
 
 
@@ -274,43 +278,60 @@ def _fetch_a_share(symbol: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def _fetch_yahoo(symbol: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """港/美股 Yahoo v8 chart。**任何解析异常统一转 DataUnavailable**。
+
+    🔴 2026-10-26 对抗性审查 M-1：原实现遇到异常 JSON 形状（缺 indicators / quote 空 /
+       gmtoffset 是字符串）会抛 KeyError / IndexError / TypeError 并穿透到最外层，
+       用户看到的是 Python traceback 而不是「行情数据获取失败」。
+    """
     market, vsym = _symbol_kind(symbol)
     # period1=0 表示取全历史（Yahoo range=max 会静默降采样，必须显式窗口）
     p1 = 0 if LIVE_DAILY_BARS <= 0 else int(
         (datetime.utcnow() - timedelta(days=int(LIVE_DAILY_BARS * 1.6))).timestamp())
-    r = _req(YAHOO_CHART.format(symbol=vsym), {"period1": p1, "period2": 9999999999, "interval": "1d"})
-    j = r.json()
-    chart = j.get("chart", {})
-    if chart.get("error"):
-        raise DataUnavailable(f"Yahoo无此标的: {vsym}｜{chart['error']}")
-    res = (chart.get("result") or [None])[0]
-    if not res or "timestamp" not in res:
-        raise DataUnavailable(f"Yahoo无数据: {vsym}")
-    ts = res["timestamp"]
-    q = res["indicators"]["quote"][0]
-    off = res.get("meta", {}).get("gmtoffset", 0)
-    # ⚠️ 2026-10-25：Yahoo 返回的时间戳含日内时分（如 17:30），
-    # 直接用会导致与底库（纯日期）对齐失败 → 必须归一化为交易日零点
-    dates = pd.to_datetime([t - off for t in ts], unit="s").normalize()
-    daily = pd.DataFrame({
-        "date": dates, "open": q.get("open"), "high": q.get("high"),
-        "low": q.get("low"), "close": q.get("close"), "volume": q.get("volume"),
-    })
-    adj = (res["indicators"].get("adjclose") or [{}])[0].get("adjclose")
-    if adj is not None:
-        daily["adjclose"] = adj
-    daily = daily.dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
+    try:
+        r = _req(YAHOO_CHART.format(symbol=vsym), {"period1": p1, "period2": 9999999999, "interval": "1d"})
+        j = r.json()
+        chart = j.get("chart", {})
+        if chart.get("error"):
+            raise DataUnavailable("Yahoo无此标的: %s｜%s" % (vsym, chart["error"]))
+        res = (chart.get("result") or [None])[0]
+        if not res or "timestamp" not in res:
+            raise DataUnavailable("Yahoo无数据: %s" % vsym)
+        ts = res["timestamp"]
+        quote = (res.get("indicators") or {}).get("quote") or [{}]
+        q = quote[0] or {}
+        if not q.get("close"):
+            raise DataUnavailable("Yahoo返回结构异常（无 quote/close）: %s" % vsym)
+        # 🔴 2026-10-26 修复（自查 + 对抗性审查同时命中）：
+        #    Yahoo 时间戳是 UTC 的「当地开盘时刻」：
+        #      港股 01:30 UTC = 09:30 HKT（当天）→ UTC 日期即交易日 ✅
+        #      美股 13:30 UTC = 09:30 ET（当天）→ 同样 ✅
+        #    原实现 `t - off` 减 8 小时（港股）→ 退到前一天 17:30 → normalize 后**整体错位一天**。
+        #    实测港股同日一致率仅 2.8%，「错一天配对」100%。美股因 offset 为负恰好没暴露。
+        dates = pd.to_datetime(list(ts), unit="s").normalize()
+        daily = pd.DataFrame({
+            "date": dates, "open": q.get("open"), "high": q.get("high"),
+            "low": q.get("low"), "close": q.get("close"), "volume": q.get("volume"),
+        })
+        adj = ((res.get("indicators") or {}).get("adjclose") or [{}])[0].get("adjclose")
+        if adj is not None:
+            daily["adjclose"] = adj
+        daily = daily.dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
 
-    # 因子：用 adjclose/close 反推逐日前复权因子（与底库 factors 结构一致）
-    recs = []
-    if "adjclose" in daily.columns:
-        ratio = (daily["adjclose"] / daily["close"]).replace([float("inf"), -float("inf")], pd.NA)
-        for d, v in zip(daily["date"], ratio):
-            if pd.isna(v) or v <= 0:
-                continue        # 负/零 adjclose 不采信（沿用 fetch_yahoo.py 规则）
-            recs.append({"kind": "qfq", "date": d, "factor": 1.0 / float(v)})
-    factors = pd.DataFrame(recs)
-    return daily, factors
+        # 因子：用 adjclose/close 反推逐日前复权因子
+        recs = []
+        if "adjclose" in daily.columns:
+            ratio = (daily["adjclose"] / daily["close"]).replace([float("inf"), -float("inf")], pd.NA)
+            for d, v in zip(daily["date"], ratio):
+                if pd.isna(v) or v <= 0:
+                    continue        # 负/零 adjclose 不采信（沿用 fetch_yahoo.py 规则）
+                recs.append({"kind": "qfq", "date": d, "factor": 1.0 / float(v)})
+        factors = pd.DataFrame(recs)
+        return daily, factors
+    except DataUnavailable:
+        raise
+    except Exception as e:      # noqa: BLE001 —— 任何解析异常都收敛成明确失败
+        raise DataUnavailable("Yahoo 数据解析失败（%s）: %s" % (vsym, str(e)[:120]))
 
 
 def _apply_guards(symbol: str, daily: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
@@ -417,6 +438,23 @@ def _stale_info(trade_date: pd.Timestamp, today: pd.Timestamp | None = None) -> 
     return (tdays > STALE_TRADING_DAYS), days, tdays
 
 
+# ══════════════════════════════════════════════════
+#  🔴 验收口径（2026-10-26 导师终审 C-1，务必照此理解，别再误用）
+#
+#  「与底库逐位一致」的准确含义，以及它**不能**用来做什么：
+#   · 成立的部分：同一交易日、同一原始价语料下，本模块的复权算法（原始价 ÷ 因子）
+#     与知识库 l1_engine 数值完全一致 —— 这证明的是**算法移植保真**。
+#   · 不成立的部分：底库是**某一时刻的静态快照**（止于某个交易日，且末日常为盘中数据）。
+#     当数据商后来修订了历史收盘价时，现拉值会与底库不同（实测 NVDA 2026-10-16：
+#     Yahoo 现拉 214.13 vs 底库 216.415，差 2.28）。这是数据修订，不是算法错。
+#   · 因此：**不得再用「与底库逐位一致」当发布验收标准** ——
+#     那等于把底库某个时点的快照当成金标准，与"用静态快照当依赖"是同一个毛病的另一面。
+#     正确做法：判定以**用户此刻能拉到的数据**为准；差异只做记录，不做"谁对谁错"的判断。
+#
+#  已知的真实差异（记录，非待修）：
+#   · 美股个别交易日数据商修订（如 NVDA 2026-10-16 差 2.28）→ 临界月份可能翻转结论，
+#     但这类月份贴0轴比值往往已接近阈值，方法论上本就应谨慎（贴0轴 → 不可判）。
+#
 # ══════════════════════════════════════════════════
 #  对外主入口（移植自 data_source.load_daily，缓存改为用户目录）
 # ══════════════════════════════════════════════════

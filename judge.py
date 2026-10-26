@@ -795,14 +795,17 @@ def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None,
     #    · 默认 True：直接调本模块（如测试）视为"调用方已处理金融判断"；
     #      只有 holdle_data.py 真实链路会在查询失败时显式传 False
     #      → 无法确认是否金融，按方法论不应下结论（否则就是 C2 那个 P0 的静默放行）
-    if industry is None and not finance_checked:
-        out["status"] = "indeterminate"
-        out["indeterminate_reason"] = "finance_unverified"
-        out["required_statement"]["units"].append(_unit(20, "R-FINANCE-UNVERIFIED",
-            "无法确认该股是否属于金融类（金融类按 HOLDLE 方法论不参与状态A判定），"
-            "因此本次不做判定。请安装数据依赖后重试（pip install akshare）；"
-            "在确认之前，请不要用其它方式推断该股的金融属性。"))
-        return _finalize(out)
+    # 🔴 2026-10-26 导师终审 C-2 修复：
+    #    原来的实现是「finance_checked=False → 一律拒判」，导师裁定这不成立——
+    #    「环境缺依赖」（akshare 没装/接口挂）≠「该股无法确认是否金融」。
+    #    前者是**这次没做校验**，应当照常判定 + 显式告警；只有后者（接口正常返回但字段空）才拒判。
+    #    （对应 _lookup_industry 的 'nodep'/'error' vs 'empty' 三态）
+    #    关键：告警**必须进 final_text** —— SKILL.md 规定模型只能转述 final_text，
+    #    只打 stdout 的话模型永远念不到，用户会拿到一份"对金融股可能不适用"却毫不知情的结论。
+    if not finance_checked:
+        out["required_statement"]["units"].append(_unit(15, "R-FINANCE-UNCHECKED",
+            "注意：本次未能核验该股的金融属性（金融类按 HOLDLE 方法论不参与状态A判定），"
+            "以下结论对银行/保险/证券等金融股可能不适用；若该股属于金融行业，请以不判定为准。"))
     if industry and any(k in str(industry) for k in FINANCE_KEYWORDS):
         out["status"] = "indeterminate"; out["indeterminate_reason"] = "finance_industry"
         _ind_txt = ("该股属于%s。" % industry) if industry else "该股属于金融行业。"
@@ -829,9 +832,15 @@ def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None,
         _mw = ("所问的 %s 所在月" % as_of) if as_of else (
               ("数据截至 %s 所在月" % trade_date.strftime("%Y-%m-%d")) if _past else "本月")
         _tail = ("该月要等收完才说。" if _past else "本月要等收完才说。")
+        # 🔴 2026-10-26 导师终审 H-1：补「什么时候算收完」的预期。
+        #    月末判据刻意保守（数据没过该月日历月末就判未收完），节假日月末会多等 1~8 天。
+        #    不说清楚，用户会反复问「28 号了怎么还说没收完」。
+        #    知情的不便是可用性问题；不知情的不便是信任问题。
+        _cal_month_end = pd.Timestamp(pd.Period(str(monthly.iloc[-1]["ym"]), "M").end_time).strftime("%Y-%m-%d")
         out["required_statement"]["units"].append(_unit(7, "R-MONTH-OPEN",
             "%s尚未收完，按 HOLDLE 方法论不做判定。截至 %s 的结论是：%s；%s"
-            % (_mw, last_closed, "状态A成立" if bool(prev["state_a"]) else "状态A不成立", _tail)))
+            "（本月需等到 %s 之后的数据齐备才会判定；遇节假日休市会相应推后）"
+            % (_mw, last_closed, "状态A成立" if bool(prev["state_a"]) else "状态A不成立", _tail, _cal_month_end)))
         return _finalize(out)
 
     if sz["evaluated"] is False and sz["reason"] == "dea_near_zero":
