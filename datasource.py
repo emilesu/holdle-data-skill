@@ -380,12 +380,21 @@ def _to_qfq(daily: pd.DataFrame, factors: pd.DataFrame, adjust: str = "forward")
     #    原实现只查 `qfq_close <= 0`，inf/nan 都能漏过 → 脏数据一路喂进判定，
     #    judge 仍给出「该股不处于状态A」这种**确定的错结论**（实测 98% 的行是 inf）。
     #    现在：出现非有限值/非正值一律**拒绝判定**，绝不带着脏数据往下走。
+    # 🔴 2026-10-26 代码审查：原实现把两种完全不同的情况混成一类，导致误拒真实数据。
+    #    · 原始价 <= 0（新浪停牌日占位价 0）→ **正常现象**，置 NaN 继续
+    #      （与知识库 l1_engine 一致；实测 430047.BJ 有 5 行 close=0 的停牌日，
+    #        原实现直接抛"疑似复权因子异常"，把一只正常股票拒了）
+    #    · 因子本身 <= 0 或非有限 → **真脏**，必须拒绝判定
     _px = out["qfq_close"].to_numpy(dtype="float64")
-    bad = ~np.isfinite(_px) | (_px <= 0)
-    if bad.any():
+    _raw = pd.to_numeric(daily["close"], errors="coerce").to_numpy(dtype="float64")
+    _raw_bad = ~np.isfinite(_raw) | (_raw <= 0)          # 停牌/占位
+    _fac_bad = (~np.isfinite(_px) | (_px <= 0)) & ~_raw_bad   # 原始价正常但复权后异常 → 因子问题
+    if _fac_bad.any():
         raise DataUnavailable(
-            "复权价出现非有限值或非正值（%d/%d 行，疑似复权因子异常），"
-            "拒绝以脏数据判定。请重试；若持续出现请反馈给 HOLDLE。" % (int(bad.sum()), len(_px)))
+            "复权计算异常：%d/%d 行原始价正常但复权价非正或非有限（疑似复权因子异常），"
+            "拒绝以脏数据判定。请重试；若持续出现请反馈给 HOLDLE。" % (int(_fac_bad.sum()), len(_px)))
+    if _raw_bad.any():
+        out.loc[_raw_bad, ["qfq_close", "qfq_open", "qfq_high", "qfq_low"]] = float("nan")
     return out
 
 

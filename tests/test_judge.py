@@ -500,6 +500,28 @@ class TestNumericLocks:
         """E-06 不追 5% 必须锁死。"""
         assert judge.MISS5_PCT == 0.05
 
+    def test_state_a_requires_hist_strictly_positive(self):
+        """🔴 SA-01 边界锁：柱**必须严格 > 0** 才算状态A（`>= 0` 是错的）。
+
+        边界情形：序列首月 dif=dea=hist=0.0 —— 此时 `hist > 0` 不成立 → 状态A=False。
+        若把判据改成 `hist >= 0`，这个月会翻成 True。
+        （代码审查实测：4 只真实标的各有 1 个月 hist 恰好为 0，变异后会翻转，而测试全绿。）
+
+        这是 02 §1.2 状态A 三条定义之一：DIF≥0 且 DEA≥0 且 **柱>0**。
+        """
+        import numpy as _np
+        rng = _np.random.default_rng(1)
+        dates = pd.bdate_range("2015-01-05", periods=1200)
+        close = 10 * _np.exp(_np.cumsum(rng.normal(0.0004, 0.018, len(dates))))
+        d = pd.DataFrame({"date": dates, "open": close, "high": close * 1.01,
+                          "low": close * 0.99, "close": close, "volume": 1e5})
+        m = judge.judge_state_a(judge._resample_monthly(d))
+        zero = m[_np.isclose(m["hist"], 0.0)]
+        assert len(zero) > 0, "构造数据未产生 hist==0 的边界月，本测试空转"
+        for _, row in zero.iterrows():
+            assert row["state_a"] == False or bool(row["state_a"]) is False, \
+                "hist==0 时状态A 必须为 False（柱须严格>0），实际 %r" % row["state_a"]
+
     def test_macd_params_locked(self):
         """SA-02 MACD 参数 12/26/9 不可调。"""
         assert (judge.FAST, judge.SLOW, judge.SIG) == (12, 26, 9)

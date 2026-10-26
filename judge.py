@@ -617,19 +617,24 @@ def _build_state_a(latest, month_closed):
     return sa
 
 
-def _emit_finance_unchecked(out):
-    """把「未做金融校验」告警挂到输出上（延迟到 _finalize 统一追加）。
-
-    🔴 2026-10-26 对抗性审查 CRITICAL：原先加在判定主流程中段，
-       而「本月未收完」等早退分支在它**之前**就 return 了 →
-       真实场景（10月未收完）永远走不到 → 告警只在 stdout，模型念不到。
-       改为在 _finalize 统一追加，保证任何分支（含所有早退）都带上。
-    """
-    out["_finance_unchecked"] = True
-
-
 def _finalize(out):
     rs = out["required_statement"]
+    # 「查了但属性不明」→ 拒判（资格不明不下结论）
+    if out.pop("_finance_unconfirmed", False):
+        out["status"] = "indeterminate"
+        out["indeterminate_reason"] = "finance_unverified"
+        out["state_a"] = None
+        out["window"] = None
+        out["entry"] = None
+        out["exit"] = None
+        rs["units"] = [u for u in rs["units"] if u.get("code") not in
+                       ("R-STATE-A", "R-WINDOW-OPEN", "R-WINDOW-CLOSED", "R-STICKY",
+                        "R-REF-PRICE", "R-BREAKOUT-YES", "R-BREAKOUT-NO", "R-MISS5",
+                        "R-NO-GREEN", "R-WINDOW-EXPIRED", "R-REF-VOID", "R-DEA-ZERO")]
+        rs["units"].append({"seq": 20, "code": "R-FINANCE-UNVERIFIED",
+            "text": "无法确认该股是否属于金融类（查询结果没有给出行业信息）。"
+                    "金融类按 HOLDLE 方法论不参与状态A判定，资格不明时不做判定；"
+                    "请稍后重试，或向 HOLDLE 反馈该股行业信息缺失。"})
     # 未做金融校验的告警：无论走哪个分支都必须出现在 final_text 里
     if out.pop("_finance_unchecked", False):
         if not any(u.get("code") == "R-FINANCE-UNCHECKED" for u in rs["units"]):
@@ -653,7 +658,7 @@ def _finalize(out):
 
 
 def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None,
-          finance_checked=True):
+          finance_checked=True, finance_status=None):
     """主入口：吃**前复权日K** DataFrame，产出判定（格式 v0.4）。
 
     daily 需含列：date/open/high/low/close/volume
@@ -669,6 +674,16 @@ def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None,
         "required_statement": {"units": [], "final_text": "", "forbidden_additions": []},
         "human_judgement_required": HUMAN_JUDGEMENT_NOTES,
     }
+    # finance_status 语义（2026-10-26 导师复核纠正 —— 不能把两件事合并）：
+    #   'empty'         = 接口正常返回、但该股行业字段为空 → **无法确认 → 拒判**
+    #   'nodep'/'error' = 这次没能力查（没装 akshare / 接口挂）→ 照常判 + 告警
+    # 早期版本把两者合并成 finance_checked=False 一律"判+告警"，导师判定处置偏松：
+    # 「无法确认是否金融」是**资格问题**，资格不明不该下结论。
+    if finance_status == "empty":
+        out["_finance_unconfirmed"] = True
+    elif not finance_checked:
+        out["_finance_unchecked"] = True
+
     if daily is None or len(daily) == 0:
         out["status"] = "indeterminate"; out["indeterminate_reason"] = "data_missing"
         out["required_statement"]["units"] = [_unit(20, "R-DATA-MISSING",
@@ -817,10 +832,7 @@ def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None,
     #    「环境缺依赖」（akshare 没装/接口挂）≠「该股无法确认是否金融」。
     #    前者是**这次没做校验**，应当照常判定 + 显式告警；只有后者（接口正常返回但字段空）才拒判。
     #    （对应 _lookup_industry 的 'nodep'/'error' vs 'empty' 三态）
-    #    关键：告警**必须进 final_text** —— SKILL.md 规定模型只能转述 final_text，
-    #    只打 stdout 的话模型永远念不到，用户会拿到一份"对金融股可能不适用"却毫不知情的结论。
-    if not finance_checked:
-        _emit_finance_unchecked(out)
+    #    ⚠️ 告警/拒判标记已在函数入口设置（见 out 初始化后那段），此处不再重复设置。
     if industry and any(k in str(industry) for k in FINANCE_KEYWORDS):
         out["status"] = "indeterminate"; out["indeterminate_reason"] = "finance_industry"
         _ind_txt = ("该股属于%s。" % industry) if industry else "该股属于金融行业。"
@@ -886,8 +898,12 @@ def judge(daily, code, market="a", stock_name=None, industry=None, as_of=None,
                 % (w["event_month"], label, w["alive"]["close_month"],
                    ("（%s）" % cr) if cr else "")))
     if sz["is_sticky"] is True:
+        # 🔴 2026-10-26 导师复核：「贴0轴」「归为绿柱」是**内部复盘专用语，不得对用户直出**
+        #    （术语表 v1.10 §3.5）。改为效果白话，且**不展开状态A的三条定义**——
+        #    导师明确指出：写成"状态A按双线条件计算"会漏掉「柱>0」，等于告诉用户错误的定义。
+        #    原则：宁可不说，也不要说错。
         out["required_statement"]["units"].append(_unit(30, "R-STICKY",
-            "%s 柱子贴近 0 轴，按方法论归为绿柱，不构成开窗事件。" % latest["ym"]))
+            "%s 这个月柱子贴近零轴，柱子方向不作数——按方法论，这个月不算出现开窗机会。" % latest["ym"]))
 
     out["entry"] = _build_entry(events, daily, monthly, judge_from)
     en = out["entry"]

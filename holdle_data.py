@@ -63,7 +63,7 @@ except ImportError:
     ak = None
 
 # ── 版本与更新（2026-08-19 新增自更新机制，2026-08-25 安全加固） ──────
-VERSION = "1.1.3"                      # skill 包版本（与 version.json 对齐）
+VERSION = "1.1.4"                      # skill 包版本（与 version.json 对齐）
 
 # 🔴 v1.0.8（2026-10-26）：自更新从「只更新自己」扩展为「更新自己 + 附属模块」。
 #   背景：judge.py（判定模块）是 v1.0.8 新增的附属文件，只更新 holdle_data.py 会导致
@@ -993,7 +993,8 @@ def main():
                       f"判定结果对金融股可能不适用（金融类按方法论不参与判定）。")
             _j = _judge.judge(daily_full, code=code, market=market,
                               stock_name=None, industry=_industry,
-                              finance_checked=(_fin_st != 'empty'))
+                              finance_checked=(_fin_st in ('found',)),
+                              finance_status=_fin_st)
             _jpath = f"{out_dir}/{code}_判定.json"
             _judge.dump(_j, _jpath)
             print("\n" + "=" * 70)
