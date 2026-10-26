@@ -12,6 +12,7 @@
 跑法：cd holdle-data-skill && python -m pytest tests/ -q
 """
 import importlib.util
+import os
 import pathlib
 import sys
 
@@ -220,25 +221,28 @@ class TestAsOfReplay:
 #    这里的用例必须做到：把修复改回去，测试要红。
 class TestP0RegressionGuards:
     def test_data_end_must_not_say_expired(self):
-        """expire_reason == 'data_end'（数据到头、窗口仍存活）时，final_text 不得说「有效期已过」。"""
-        from datetime import date
-        # 构造一个价格先涨后横的序列，保证能开出窗口
-        rng = np.random.default_rng(11)
-        dates = pd.bdate_range("2023-01-02", "2025-12-31")
-        n = len(dates)
-        close = 10 * np.exp(np.cumsum(rng.normal(0.0006, 0.015, n)))
-        # 末段横盘：制造"窗口还开着但没突破"的场景
-        close[-40:] = close[-41]
-        d = pd.DataFrame({"date": dates, "open": close, "high": close * 1.002,
-                          "low": close * 0.998, "close": close, "volume": 1e5})
-        r = judge.judge(d, code="TEST")
+        """🔴 C2 (P0) 必红用例：expire_reason=='data_end' 时不得说「入场有效期已过」。
+
+        用**确定性 fixture**（tests/fixtures/603637_data_end_case.csv，36KB，761 行），
+        实测命中 data_end + 窗口存活 + 参考价 13.5594。
+        原实现用随机游走构造，跑不到该分支而 pytest.skip —— 生产上等于没有保护
+        （对抗性审查变异测试证实：把 C2 改回旧写法，测试仍 35 passed 全绿）。
+        """
+        p = os.path.join(ROOT, "tests", "fixtures", "603637_data_end_case.csv")
+        assert os.path.exists(p), "缺少 C2 回归 fixture：%s" % p
+        d = pd.read_csv(p, parse_dates=["date"])
+        r = judge.judge(d, code="603637")
         en = r.get("entry") or {}
-        if en.get("expire_reason") == "data_end":
-            txt = r["required_statement"]["final_text"]
-            assert "入场有效期已过" not in txt, "data_end 分支不得说「有效期已过」"
-            assert ("入场等待继续有效" in txt) or ("窗口仍存活" in txt), "应说明窗口仍存活"
-        else:
-            pytest.skip("本次构造未命中 data_end 分支（expire_reason=%r）" % en.get("expire_reason"))
+        # 先断言场景真的命中（防止数据变化后测试静默空转）
+        assert en.get("expire_reason") == "data_end", \
+            "fixture 未命中 data_end 分支（实际 %r），测试失去保护意义" % en.get("expire_reason")
+        assert ((r.get("window") or {}).get("alive") or {}).get("is_alive") is True, \
+            "fixture 未命中「窗口存活」场景"
+        txt = r["required_statement"]["final_text"]
+        # 核心断言：这两条任一失效，说明 C2 修复被改回旧写法
+        assert "入场有效期已过" not in txt, "data_end 分支不得说「有效期已过」（C2 复活）"
+        assert ("入场等待继续有效" in txt) or ("窗口仍存活" in txt), \
+            "应说明窗口仍存活、入场等待继续有效"
 
     def test_window_alive_never_says_expired(self):
         """窗口 is_alive=True 时，final_text 绝不能出现「入场有效期已过」。
@@ -252,7 +256,9 @@ class TestP0RegressionGuards:
             if os.path.exists(p):
                 cand.append((f, p))
         if not cand:
-            pytest.skip("仓库内无真实缓存行情，跳过")
+            pytest.skip("仓库内无真实缓存行情（holdle_data/ 在 .gitignore 内，CI 环境会跳过）。"
+                        "该用例需要真实行情才能构造出「窗口存活」分支，"
+                        "合成数据实测 6 个种子 0 命中——宁可跳过，也不造假场景让它假绿。")
         hit = 0
         for name, path in cand:
             d = pd.read_csv(path, parse_dates=["date"])[["date", "open", "high", "low", "close", "volume"]]
@@ -372,7 +378,8 @@ class TestMentorRecheckSuggestions:
         import os
         p = os.path.join(ROOT, "holdle_data", "300308_日K_前复权.csv")
         if not os.path.exists(p):
-            pytest.skip("无真实缓存行情")
+            pytest.skip("无真实缓存行情（holdle_data/ 未入库，CI 会跳过）——"
+                        "该用例需真实数据才能命中「回放 + 窗口存活」分支")
         d = pd.read_csv(p, parse_dates=["date"])[["date", "open", "high", "low", "close", "volume"]]
         hit = 0
         for a in ("2026-04-30", "2026-05-29", "2025-12-31"):
